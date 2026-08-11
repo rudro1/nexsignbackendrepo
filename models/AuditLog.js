@@ -97,6 +97,11 @@ const locationSchema = new mongoose.Schema(
       type: String,
       default: null, // "Rajshahi, BD - 6400" (formatted)
     },
+    geo_source: {
+      type: String,
+      enum: ['gps', 'ip', 'local', 'unknown', null],
+      default: null,
+    },
   },
   { _id: false }
 );

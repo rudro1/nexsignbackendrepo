@@ -235,6 +235,9 @@ try {
   const templateRoutes = require('./routes/templateRoutes');
   app.use('/api/templates', templateRoutes);
   console.log('✅ templateRoutes loaded successfully');
+  const campaignRoutes = require('./routes/campaignRoutes');
+  app.use('/api/template-campaigns', campaignRoutes);
+  console.log('✅ campaignRoutes loaded successfully');
 } catch (err) {
   console.error('❌ templateRoutes failed to load:', err.message);
   console.error(err.stack);

@@ -12,14 +12,22 @@ const ctrl = require('../controllers/templateController');
 // ── Authenticated routes (boss / admin) ──────────────────────────────────────
 router.post  ('/',                               auth, ctrl.createTemplate);
 router.get   ('/',                               auth, ctrl.getTemplates);
+router.post  ('/email-preview',                  auth, ctrl.previewEmployeeEmail);
+router.post  ('/:id/reuse',                      auth, require('../controllers/campaignController').reuseTemplate);
+router.get   ('/:id/campaigns',                  auth, require('../controllers/campaignController').listCampaigns);
 router.get   ('/:id',                            auth, ctrl.getTemplate);
 router.delete('/:id',                            auth, ctrl.deleteTemplate);
 router.post  ('/:id/boss-sign',                  auth, ctrl.bossSign);
+router.post  ('/:id/email-preview',             auth, ctrl.previewEmployeeEmail);
+router.post  ('/:id/resend-failed',              auth, ctrl.resendFailedEmails);
 
 // FIX #4: resend param was :sid — kept compatible, renamed to :sessionId for clarity
 router.post  ('/:id/sessions/:sessionId/resend', auth, ctrl.resendEmail);
+router.post  ('/:id/sessions/:sessionId/resend-signed', auth, ctrl.resendSignedCopy);
+router.get   ('/:id/sessions/:sessionId/pdf', auth, ctrl.getSessionSignedPdf);
 
 router.get   ('/:id/sessions',                      auth, ctrl.getTemplateSessions);
+router.get   ('/:id/audit',                         auth, ctrl.getTemplateAudit);
 
 // FIX #4: PUT /:id — was missing entirely; updateTemplate stub
 // (wire to ctrl.updateTemplate when controller function is added)

@@ -88,6 +88,13 @@ const TemplateSessionSchema = new mongoose.Schema({
     index: true,
   },
 
+  /** Reuse wave — links session to a TemplateCampaign batch */
+  campaignId: {
+    type:  mongoose.Schema.Types.ObjectId,
+    ref:   'TemplateCampaign',
+    index: true,
+  },
+
   // ── Recipient info (snapshot at send time) ────────
   recipientName:        { type: String, required: true, trim: true },
   recipientEmail:       { type: String, required: true, lowercase: true, trim: true },
@@ -131,6 +138,7 @@ const TemplateSessionSchema = new mongoose.Schema({
   // ── Individual signed PDF ─────────────────────────
   signedFileUrl:      { type: String, default: null },
   signedFilePublicId: { type: String, default: '' },
+  localSignedPdfPath: { type: String, default: null },
 
   // ── Timestamps ────────────────────────────────────
   sentAt:     { type: Date, default: Date.now  },
@@ -145,6 +153,12 @@ const TemplateSessionSchema = new mongoose.Schema({
   // ── Reminder tracking ─────────────────────────────
   reminderCount:  { type: Number, default: 0    },
   lastReminderAt: { type: Date,   default: null  },
+
+  // ── Email delivery tracking ───────────────────────
+  emailDelivered:     { type: Boolean, default: false },
+  emailError:           { type: String,  default: ''  },
+  emailAttempts:        { type: Number,  default: 0  },
+  lastEmailAttemptAt:   { type: Date,    default: null },
 
   // ── Signing metadata ──────────────────────────────
   signingMeta: {

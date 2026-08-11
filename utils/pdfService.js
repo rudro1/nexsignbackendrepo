@@ -1388,6 +1388,7 @@
 
 const { PDFDocument, rgb, StandardFonts, degrees, BlendMode } = require('pdf-lib');
 const fetch = require('node-fetch');
+const crypto = require('crypto');
 
 // ─── Brand palette ────────────────────────────────────────────────────────────
 const C = {
@@ -1411,9 +1412,21 @@ const C = {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Fetch PDF from URL / base64 dataURI / filesystem path → Uint8Array */
+/** Fetch PDF from URL / base64 dataURI / filesystem path / document record → Uint8Array */
 async function fetchPdfBytes(source) {
   if (!source) throw new Error('[pdfService] No PDF source provided.');
+
+  // Document/template record — prefer local cached copy
+  if (typeof source === 'object' && source !== null) {
+    try {
+      const { getPdfBytes } = require('./pdfStorage');
+      const buf = await getPdfBytes(source);
+      return new Uint8Array(buf);
+    } catch (e) {
+      if (!source.fileUrl) throw e;
+      source = source.fileUrl;
+    }
+  }
 
   if (source.startsWith('http://') || source.startsWith('https://')) {
     const ctrl = new AbortController();
@@ -1489,6 +1502,22 @@ function toAbsPt(field, pw, ph) {
   return { absX, absY, absW, absH };
 }
 
+// ─── Load signature/image bytes from data URI or URL ─────────────────────────
+async function loadImageBytes(strVal) {
+  if (!strVal || typeof strVal !== 'string') return null;
+  const trimmed = strVal.trim();
+  if (trimmed.startsWith('data:image/')) {
+    const b64 = trimmed.split(',')[1];
+    return b64 ? Buffer.from(b64, 'base64') : null;
+  }
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    const res = await fetch(trimmed, { headers: { Accept: 'image/*,*/*' } });
+    if (!res.ok) return null;
+    return Buffer.from(await res.arrayBuffer());
+  }
+  return null;
+}
+
 // ─── Render a single field onto a PDF page ────────────────────────────────────
 async function renderField(page, field, value, pdfDoc, fontReg, fontBold) {
   if (value === null || value === undefined) return;
@@ -1504,21 +1533,17 @@ async function renderField(page, field, value, pdfDoc, fontReg, fontBold) {
   try {
     switch (field.type) {
 
-      // ── Signature / Initials → embed as PNG image ─────────────────────────
+      // ── Signature / Initials → embed as PNG/JPG image ─────────────────────
       case 'signature':
       case 'initial':
       case 'initials': {
-        if (!strVal.startsWith('data:image/')) break;
-        const b64      = strVal.split(',')[1];
-        if (!b64) break;
-        const imgBytes = Buffer.from(b64, 'base64');
+        const imgBytes = await loadImageBytes(strVal);
+        if (!imgBytes) break;
         let img;
         try {
-          img = strVal.includes('image/png')
-            ? await pdfDoc.embedPng(imgBytes)
-            : await pdfDoc.embedJpg(imgBytes);
+          img = await pdfDoc.embedPng(imgBytes);
         } catch {
-          try { img = await pdfDoc.embedPng(imgBytes); } catch { break; }
+          try { img = await pdfDoc.embedJpg(imgBytes); } catch { break; }
         }
         const dims = img.scaleToFit(absW - 4, absH - 4);
         page.drawImage(img, {
@@ -1651,18 +1676,21 @@ async function embedBossSignature({ fileUrl, signatureDataUrl, fields = [], fiel
 // 3. Appends professional audit trail page
 // Returns final PDF as Buffer (ready to attach to email / save to DB).
 // ══════════════════════════════════════════════════════════════════════════════
-async function generateEmployeePdf(bossSignedPdfSource, employeeFields = [], sessionDoc) {
-  // Step 1: Get boss-signed PDF bytes
-  const bossBytes = typeof bossSignedPdfSource === 'string'
-    ? await fetchPdfBytes(bossSignedPdfSource)
-    : bossSignedPdfSource;
+async function generateEmployeePdf(bossSignedPdfSource, allFields = [], sessionDoc) {
+  // Step 1: Get boss-signed PDF bytes (or original template PDF)
+  let bossBytes;
+  if (bossSignedPdfSource instanceof Uint8Array || Buffer.isBuffer(bossSignedPdfSource)) {
+    bossBytes = bossSignedPdfSource;
+  } else {
+    bossBytes = await fetchPdfBytes(bossSignedPdfSource);
+  }
 
-  // Step 2: Embed employee fields
+  // Step 2: Embed boss + employee field values (signatures, text, dates, etc.)
   const b64Source = 'data:application/pdf;base64,' + Buffer.from(bossBytes).toString('base64');
-  const withEmpFields = await mergeSignaturesIntoPDF(b64Source, employeeFields);
+  const withFields = await mergeSignaturesIntoPDF(b64Source, allFields);
 
-  // Step 3: Append audit page
-  const finalPdf = await appendAuditPage(withEmpFields, sessionDoc);
+  // Step 3: Append audit certificate page
+  const finalPdf = await appendAuditPage(withFields, sessionDoc);
   return finalPdf;
 }
 
@@ -1765,9 +1793,11 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc) {
     if (s.city || s.country)
       details.push(['Location', safe([s.city, s.region, s.country].filter(Boolean).join(', ') + (s.postalCode ? ` — ${s.postalCode}` : ''))]);
     if (s.latitude && s.longitude)
-      details.push(['Coordinates', `${s.latitude} N, ${s.longitude} E`]);
+      details.push(['Coordinates', `${s.latitude}, ${s.longitude}${s.latitude.startsWith('-') ? '' : ''}`]);
     if (s.timezone)
       details.push(['Timezone', safe(s.timezone)]);
+    if (s.geoSource || s.geo_source)
+      details.push(['Location Source', safe(s.geoSource || s.geo_source)]);
 
     const rowH = 46 + details.length * 13;
 
@@ -1836,14 +1866,33 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc) {
   // ── Legal disclaimer ──────────────────────────────────────────────────────
   if (Y > M + 60) {
     Y -= 10;
-    const dH = 48;
+    const signersForHash = signers.map(s => ({
+      email:     s.email || s.recipientEmail,
+      signedAt:  s.signedAt,
+      ip:        s.ipAddress || s.ip,
+    }));
+    const auditRecordId = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({
+        docId: String(doc._id || doc.id || ''),
+        title: doc.title || doc.documentTitle,
+        completedAt: doc.completedAt || new Date().toISOString(),
+        signers: signersForHash,
+      }))
+      .digest('hex')
+      .slice(0, 16)
+      .toUpperCase();
+
+    const dH = 62;
     rect(page, M, Y - dH, CW, dH, C.blueL, C.lgrey);
     rect(page, M, Y - dH, 4,  dH, C.blue);
-    txt(page, 'LEGAL NOTICE', M + 10, Y - 14, { font: fontB, size: 8, color: C.blue });
-    txt(page, 'This certificate is an electronically generated record of all signature events associated with this document.',
+    txt(page, 'LEGAL NOTICE — CERTIFICATE OF COMPLETION', M + 10, Y - 14, { font: fontB, size: 8, color: C.blue });
+    txt(page, 'This certificate is an electronically generated legal record of all signature events associated with this document.',
       M + 10, Y - 26, { font: fontR, size: 7.5, color: C.grey, maxWidth: CW - 20 });
-    txt(page, 'All events are cryptographically timestamped. This document is legally binding under ESIGN Act, eIDAS, and applicable e-signature laws.',
+    txt(page, 'Legally binding under the U.S. ESIGN Act (15 U.S.C. §7001), eIDAS (EU), and applicable electronic signature laws. Location data may include GPS (device) or IP-based estimates.',
       M + 10, Y - 38, { font: fontR, size: 7.5, color: C.grey, maxWidth: CW - 20 });
+    txt(page, `Audit Record ID: ${auditRecordId}  |  UTC: ${new Date().toISOString()}`,
+      M + 10, Y - 52, { font: fontM, size: 7, color: C.dark, maxWidth: CW - 20 });
   }
 
   // Footer on last page

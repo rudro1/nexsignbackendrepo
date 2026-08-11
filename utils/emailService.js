@@ -2407,67 +2407,306 @@ function getDocumentSubtitle(title) {
   return 'Document for Signature';
 }
 
+// ─── Email copy helpers ───────────────────────────────────────────────────────
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatBodyParagraphs(paragraphs) {
+  return (paragraphs || [])
+    .filter(Boolean)
+    .map(p => `<p style="margin:0 0 16px;font-size:15px;color:#334155;line-height:1.8;
+                         font-family:Georgia,'Times New Roman',Times,serif;">${p}</p>`)
+    .join('');
+}
+
+function buildCustomMessageBlock(message, senderName) {
+  const text = String(message || '').trim();
+  if (!text) return '';
+  const safe = escapeHtml(text).replace(/\n/g, '<br/>');
+  return `
+    <table width="100%" cellpadding="0" cellspacing="0"
+           style="margin:0 0 4px;border-left:3px solid #0284c7;background:#f8fafc;border-radius:0 8px 8px 0;">
+      <tr><td style="padding:16px 20px;">
+        <p style="margin:0 0 8px;font-size:11px;font-weight:700;color:#64748b;
+                  text-transform:uppercase;letter-spacing:0.5px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+          Message from ${escapeHtml(senderName)}
+        </p>
+        <p style="margin:0;font-size:14px;color:#334155;line-height:1.75;
+                  font-family:Georgia,'Times New Roman',Times,serif;">${safe}</p>
+      </td></tr>
+    </table>`;
+}
+
+function buildClosingBlock(closingHtml) {
+  if (!closingHtml) return '';
+  return `
+    <p style="margin:24px 0 0;font-size:15px;color:#334155;line-height:1.75;
+              font-family:Georgia,'Times New Roman',Times,serif;">${closingHtml}</p>`;
+}
+
+function senderLine(name, designation, company) {
+  const parts = [escapeHtml(name)];
+  if (designation) parts[0] += `, ${escapeHtml(designation)}`;
+  if (company) parts.push(escapeHtml(company));
+  return parts.join('<br/>');
+}
+
+/** Replace {{tokens}} in custom email subject/body */
+function applyEmailTokens(text, data) {
+  if (!text) return '';
+  const link = data.actionUrl || data.signingLink || '';
+  const replacements = {
+    '{{signerName}}':     data.signerName || data.recipientName || data.employeeName || '',
+    '{{recipientName}}':  data.recipientName || data.signerName || data.employeeName || '',
+    '{{employeeName}}':   data.employeeName || data.recipientName || data.signerName || '',
+    '{{documentTitle}}':  data.docTitle || data.documentTitle || '',
+    '{{docTitle}}':       data.docTitle || data.documentTitle || '',
+    '{{signingLink}}':    link,
+    '{{link}}':           link,
+    '{{companyName}}':    data.companyName || '',
+    '{{senderName}}':     data.senderName || data.bossName || '',
+    '{{partyNumber}}':    String(data.partyNumber ?? ''),
+    '{{totalParties}}':   String(data.totalParties ?? ''),
+    '{{expiryDate}}':     data.expiryDate || '',
+  };
+  let out = String(text);
+  for (const [token, val] of Object.entries(replacements)) {
+    out = out.split(token).join(val);
+  }
+  return out;
+}
+
+function customBodyToHtml(text) {
+  const t = String(text || '').trim();
+  if (!t) return '';
+  if (/<[a-z][\s\S]*>/i.test(t)) return t;
+  return escapeHtml(t).replace(/\n/g, '<br/>');
+}
+
+function customBodyHasLink(text, actionUrl) {
+  const raw = String(text || '');
+  return (
+    /\{\{(signingLink|link)\}\}/.test(raw) ||
+    (actionUrl && raw.includes(actionUrl))
+  );
+}
+
 // ─── Email type configs ───────────────────────────────────────────────────────
 const EMAIL_CONFIG = {
 
   signing_request: {
-    subject:     d => `${d.companyName} requests your signature on "${d.docTitle}"`,
+    subject: d => `Action Required: Please sign "${d.docTitle}" — ${d.companyName}`,
     heroIcon:    'sign',
     iconBg:      '#EFF6FF',
-    heroTitle:   d => `You have a document to sign`,
-    heroMessage: d => `Hello ${d.signerName},<br><br>${d.companyName} has sent you <strong>"${d.docTitle}"</strong> for your electronic signature.<br>Please review and sign at your earliest convenience.`,
-    buttonText:  'Review & Sign Document &rarr;',
+    heroTitle:   () => 'Signature Requested',
+    bodyParagraphs: d => {
+      const paras = [
+        `Dear ${escapeHtml(d.signerName)},`,
+        `${escapeHtml(d.companyName)} has requested your electronic signature on the document referenced below. Please review its contents carefully and sign at your earliest convenience.`,
+      ];
+      if (d.partyNumber && d.totalParties > 1) {
+        paras.push(
+          `You are signer ${d.partyNumber} of ${d.totalParties} in the signing sequence. The document will proceed to the next party once you have completed your signature.`,
+        );
+      }
+      paras.push(
+        `If you have any questions regarding this document, please contact ${escapeHtml(d.senderName)} directly.`,
+      );
+      return paras;
+    },
+    closingLine: d => {
+      const sig = senderLine(d.senderName, d.senderDesignation, d.companyName);
+      return `Thank you for your prompt attention.<br/><br/>Sincerely,<br/>${sig}`;
+    },
+    buttonText:  d => `Sign &ldquo;${escapeHtml(d.docTitle || 'Document')}&rdquo;`,
+    showButton:  true,
+    hasPdf:      false,
+  },
+
+  /** Template employee signing — personalized professional body */
+  employee_signing_request: {
+    subject: d => `Please sign "${d.docTitle}" — ${d.companyName || 'NexSign'}`,
+    heroIcon:    'sign',
+    iconBg:      '#EFF6FF',
+    heroTitle:   () => 'Your Signature Is Required',
+    bodyParagraphs: d => {
+      const name = escapeHtml(d.employeeName || d.signerName || 'Colleague');
+      const boss = escapeHtml(d.bossName || d.senderName || 'Your manager');
+      const company = escapeHtml(d.companyName || 'your organization');
+      const title = escapeHtml(d.docTitle || 'Document');
+      const paras = [
+        `Dear ${name},`,
+      ];
+      if (d.employeeDesignation) {
+        paras.push(
+          `This request is addressed to you as <strong>${escapeHtml(d.employeeDesignation)}</strong> at ${company}.`,
+        );
+      }
+      paras.push(
+        `${boss} has reviewed and signed <strong>${title}</strong>. Your electronic signature is now required to complete this document.`,
+        `Please open the secure link below, review the document in full, and sign at your earliest convenience. This link is unique to you and should not be forwarded.`,
+      );
+      if (d.expiryDate) {
+        paras.push(`This signing link expires on <strong>${escapeHtml(d.expiryDate)}</strong>.`);
+      }
+      paras.push(
+        `If you have any questions about this document, please contact ${boss}${d.bossDesignation ? ` (${escapeHtml(d.bossDesignation)})` : ''} directly.`,
+      );
+      return paras;
+    },
+    closingLine: d => {
+      const sig = senderLine(
+        d.bossName || d.senderName,
+        d.bossDesignation || d.senderDesignation,
+        d.companyName,
+      );
+      return `Thank you for your prompt attention.<br/><br/>Sincerely,<br/>${sig}`;
+    },
+    buttonText:  d => `Sign &ldquo;${escapeHtml(d.docTitle || 'Document')}&rdquo;`,
+    showButton:  true,
+    hasPdf:      false,
+  },
+
+  /** Owner alert when employee emails fail to deliver */
+  email_delivery_failure: {
+    subject: d => `Alert: ${d.failedCount} employee email(s) failed — "${d.docTitle}"`,
+    heroIcon:    'warning',
+    iconBg:      '#FEF2F2',
+    heroTitle:   () => 'Some Employees Did Not Receive Their Email',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.ownerName || 'Template Owner')},`,
+      `We attempted to send signing invitations for <strong>${escapeHtml(d.docTitle || 'your template')}</strong>, but <strong>${d.failedCount}</strong> of <strong>${d.totalCount}</strong> emails could not be delivered.`,
+      `The following employees did not receive their signing link:`,
+      d.failedListHtml || '',
+      `Please verify their email addresses in Template Detail and use <strong>Resend</strong> for each affected employee. You can also preview the email body before resending.`,
+    ],
+    closingLine: () => `Best regards,<br/>The NexSign Team`,
+    showButton:  false,
+    hasPdf:      false,
+  },
+
+  campaign_boss_sign: {
+    subject: d => `Your signature required: "${d.docTitle}"`,
+    heroIcon:    'sign',
+    iconBg:      '#EFF6FF',
+    heroTitle:   () => 'Authoriser Signature Required',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.signerName)},`,
+      `You have been designated as the authoriser for <strong>${escapeHtml(d.docTitle)}</strong>. Please review the document and add your signature to authorize distribution.`,
+      `After you sign, ${d.approverCount > 0 ? `${d.approverCount} approver(s) will review in sequence, then` : ''} signing links will be sent to <strong>${d.employeeCount}</strong> employee(s).`,
+      `If you have questions, contact ${escapeHtml(d.ownerName || 'the template owner')}.`,
+    ],
+    closingLine: d => `Thank you,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
+    buttonText:  d => `Sign &amp; Authorize`,
+    showButton:  true,
+    hasPdf:      false,
+  },
+
+  campaign_approver: {
+    subject: d => `Approval required (${d.stepNumber}/${d.totalSteps}): "${d.docTitle}"`,
+    heroIcon:    'sign',
+    iconBg:      '#F0F9FF',
+    heroTitle:   () => 'Your Approval Is Required',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.signerName)},`,
+      d.employeeDesignation
+        ? `As <strong>${escapeHtml(d.employeeDesignation)}</strong>, you are approver ${d.stepNumber} of ${d.totalSteps} for <strong>${escapeHtml(d.docTitle)}</strong>.`
+        : `You are approver ${d.stepNumber} of ${d.totalSteps} for <strong>${escapeHtml(d.docTitle)}</strong>.`,
+      `Please review the document. When you approve, ${d.isLastApprover ? 'signing links will be sent to all employees.' : 'the next approver in the chain will be notified.'}`,
+      d.previousApprovers
+        ? `Already approved by: ${d.previousApprovers}`
+        : '',
+    ].filter(Boolean),
+    closingLine: d => `Thank you for your review,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
+    buttonText:  () => 'Review &amp; Approve',
     showButton:  true,
     hasPdf:      false,
   },
 
   completion: {
-    subject:     d => `"${d.docTitle}" has been fully signed — Your copy is attached`,
+    subject:     d => `Completed: "${d.docTitle}" — Signed copy attached`,
     heroIcon:    'check',
     iconBg:      '#F0FDF4',
-    heroTitle:   () => `Document successfully signed!`,
-    heroMessage: d => `Hello ${d.signerName},<br><br>All parties have signed <strong>"${d.docTitle}"</strong>. Your completed copy is attached to this email.<br>This document is legally binding.`,
+    heroTitle:   () => 'Document Fully Executed',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.signerName)},`,
+      `All required parties have signed <strong>${escapeHtml(d.docTitle)}</strong>. A completed copy of the fully executed document is attached to this email for your records.`,
+      `Please retain this document in a secure location. It constitutes a legally binding agreement.`,
+    ],
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
     showButton:  false,
     hasPdf:      true,
   },
 
   cc_notification: {
-    subject:     d => `[Copy] "${d.docTitle}" — Fully executed document`,
+    subject:     d => `[Copy] "${d.docTitle}" — Fully executed`,
     heroIcon:    'copy',
     iconBg:      '#FAF5FF',
-    heroTitle:   () => `Document completed — For your records`,
-    heroMessage: d => `Hello ${d.ccName || d.signerName},<br><br>You are receiving this as a courtesy copy. <strong>"${d.docTitle}"</strong> has been fully signed by all parties.<br>A completed copy is attached for your records.`,
+    heroTitle:   () => 'Courtesy Copy — For Your Records',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.ccName || d.signerName)},`,
+      `You are receiving this email as a courtesy copy. <strong>${escapeHtml(d.docTitle)}</strong> has been fully signed by all required parties.`,
+      `The completed document is attached for your reference and records.`,
+    ],
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
     showButton:  false,
     hasPdf:      true,
   },
 
   boss_signed_confirm: {
-    subject:     d => `You've signed "${d.docTitle}" — Sending to recipients`,
+    subject:     d => `Confirmation: Your signature on "${d.docTitle}" has been recorded`,
     heroIcon:    'celebrate',
     iconBg:      '#F0FDF4',
-    heroTitle:   () => `Your signature has been recorded`,
-    heroMessage: d => `Hello ${d.bossName || d.signerName},<br><br>Your signature on <strong>"${d.docTitle}"</strong> has been saved. We are now sending signing requests to <strong>${d.recipientCount || 0} recipient(s)</strong>.<br>You will be notified when all parties have signed.`,
+    heroTitle:   () => 'Signature Recorded Successfully',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.bossName || d.signerName)},`,
+      `Your signature on <strong>${escapeHtml(d.docTitle)}</strong> has been securely recorded.`,
+      `Signing invitations are now being sent to <strong>${d.recipientCount || 0} recipient(s)</strong>. You will receive a notification once all parties have completed signing.`,
+    ],
+    closingLine: () => `Best regards,<br/>The NexSign Team`,
     showButton:  false,
     hasPdf:      false,
   },
 
   resend_request: {
-    subject:     d => `Reminder: "${d.docTitle}" still needs your signature`,
+    subject:     d => `Reminder: Signature pending on "${d.docTitle}"`,
     heroIcon:    'clock',
     iconBg:      '#FFFBEB',
-    heroTitle:   () => `This document needs your attention`,
-    heroMessage: d => `Hello ${d.signerName},<br><br>This is a friendly reminder that <strong>"${d.docTitle}"</strong> from ${d.companyName} is still waiting for your signature.<br>Your signing link has been refreshed below.`,
-    buttonText:  'Sign Now &rarr;',
+    heroTitle:   () => 'Friendly Reminder — Action Required',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.signerName)},`,
+      `This is a courteous reminder that <strong>${escapeHtml(d.docTitle)}</strong> from ${escapeHtml(d.companyName)} is awaiting your electronic signature.`,
+      `Please review and sign the document at your earliest convenience using the secure link below.`,
+    ],
+    closingLine: d => senderLine(d.senderName, d.senderDesignation, d.companyName),
+    buttonText:  'Complete Signature',
     showButton:  true,
     hasPdf:      false,
   },
 
   declined_notification: {
-    subject:     d => `"${d.docTitle}" was declined by ${d.signerName}`,
+    subject:     d => `Notice: "${d.docTitle}" was declined`,
     heroIcon:    'clock',
     iconBg:      '#FEF2F2',
-    heroTitle:   () => `A signer declined your document`,
-    heroMessage: d => `Hello ${d.signerName || 'there'},<br><br><strong>${d.declinerName || 'A signer'}</strong> declined to sign <strong>"${d.docTitle}"</strong>.${d.reason ? `<br><br>Reason: ${d.reason}` : ''}`,
+    heroTitle:   () => 'Document Declined',
+    bodyParagraphs: d => {
+      const paras = [
+        `Dear ${escapeHtml(d.signerName || 'there')},`,
+        `<strong>${escapeHtml(d.declinerName || 'A signer')}</strong> has declined to sign <strong>${escapeHtml(d.docTitle)}</strong>.`,
+      ];
+      if (d.reason) {
+        paras.push(`<strong>Reason provided:</strong> ${escapeHtml(d.reason)}`);
+      }
+      paras.push(`No further action is required from other parties at this time. You may contact the signer directly if you wish to follow up.`);
+      return paras;
+    },
+    closingLine: () => `Best regards,<br/>The NexSign Team`,
     showButton:  false,
     hasPdf:      false,
   },
@@ -2486,40 +2725,129 @@ function getHeroIconHtml(iconType) {
   return icons[iconType] || icons.sign;
 }
 
+const EMAIL_NAMED_COLORS = {
+  blue: '#2563eb', red: '#dc2626', green: '#16a34a', yellow: '#ca8a04',
+  orange: '#ea580c', purple: '#9333ea', pink: '#db2777', black: '#0f172a',
+  white: '#ffffff', gray: '#64748b', grey: '#64748b', navy: '#1e3a8a',
+  teal: '#0d9488', cyan: '#0891b2', indigo: '#4f46e5', violet: '#7c3aed',
+  brown: '#92400e', gold: '#b45309', silver: '#94a3b8', sky: '#0284c7',
+  lime: '#65a30d', emerald: '#059669', rose: '#e11d48', slate: '#475569',
+};
+
+function resolveEmailColor(color) {
+  if (!color || typeof color !== 'string') return '#0f172a';
+  const c = color.trim();
+  if (!c) return '#0f172a';
+  if (c.includes('gradient')) return c;
+  if (/^#[0-9a-fA-F]{3,8}$/.test(c)) return c;
+  if (/^[0-9a-fA-F]{3,6}$/.test(c)) return `#${c}`;
+  if (/^rgb/i.test(c)) return c;
+  const named = EMAIL_NAMED_COLORS[c.toLowerCase()];
+  if (named) return named;
+  return c;
+}
+
+function headerBackgroundStyle(color) {
+  const resolved = resolveEmailColor(color);
+  if (String(color || '').includes('gradient')) return resolved;
+  // Solid color — email clients handle this reliably (gradients + named colors often fail)
+  return resolved;
+}
+
+function headerTextColor(color) {
+  const bg = resolveEmailColor(color);
+  if (!bg.startsWith('#') || bg.length < 7) return '#ffffff';
+  const hex = bg.slice(1);
+  const full = hex.length === 3
+    ? hex.split('').map(ch => ch + ch).join('')
+    : hex.slice(0, 6);
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return '#ffffff';
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.62 ? '#0f172a' : '#ffffff';
+}
+
+function normalizeLogoUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  const trimmed = url.trim();
+  if (trimmed.startsWith('blob:') || trimmed.startsWith('data:')) return '';
+  if (trimmed.startsWith('//')) return emailSafeCloudinaryLogo(`https:${trimmed}`);
+  if (trimmed.startsWith('http://')) return emailSafeCloudinaryLogo(trimmed.replace('http://', 'https://'));
+  if (trimmed.startsWith('https://')) return emailSafeCloudinaryLogo(trimmed);
+  return trimmed;
+}
+
+/** Cloudinary: force PNG + reasonable width for email client compatibility */
+function emailSafeCloudinaryLogo(url) {
+  if (!url.includes('res.cloudinary.com') || !url.includes('/image/upload/')) return url;
+  if (url.includes('/f_png') || url.includes('/f_jpg') || url.includes('/f_auto')) return url;
+  return url.replace('/upload/', '/upload/f_png,q_auto,w_320/');
+}
+
 // ─── Build full HTML email ────────────────────────────────────────────────────
 function buildEmailHtml(opts) {
   const {
-    subject, heroIcon, iconBg, heroTitle, heroMessage,
+    subject, heroIcon, iconBg, heroTitle,
+    bodyHtml, customMessageBlock, closingHtml,
     buttonText, showButton, hasPdf, actionUrl,
-    documentTitle, documentSubtitle, senderName, signerName,
+    documentTitle, documentSubtitle, senderName, senderDesignation,
     companyName, companyLogo, companyInitial, expiryDate,
+    emailHeaderColor,
   } = opts;
 
-  const logoHtml = companyLogo
-    ? `<img src="${companyLogo}" alt="${companyName}" height="40" style="max-height:40px;max-width:160px;object-fit:contain;display:block;" />`
-    : `<div style="width:44px;height:44px;border-radius:10px;background:#28ABDF;display:inline-flex;align-items:center;justify-content:center;">
-        <span style="color:#fff;font-size:22px;font-weight:800;font-family:Georgia,serif;">${companyInitial || 'N'}</span>
-       </div>`;
+  const headerBg   = headerBackgroundStyle(emailHeaderColor);
+  const headerText = headerTextColor(emailHeaderColor);
+  const safeLogo   = normalizeLogoUrl(companyLogo);
+  const logoHtml = safeLogo
+    ? `<img src="${safeLogo}" alt="${companyName || 'Logo'}" width="160" height="40" border="0"
+           style="display:block;max-height:40px;max-width:160px;width:auto;height:40px;border:0;outline:none;text-decoration:none;" />`
+    : `<table cellpadding="0" cellspacing="0" border="0"><tr><td width="44" height="44" align="center" valign="middle"
+           style="width:44px;height:44px;border-radius:10px;background:#28ABDF;font-size:22px;font-weight:800;
+                  color:#ffffff;font-family:Georgia,serif;line-height:44px;text-align:center;">
+           ${companyInitial || 'N'}
+         </td></tr></table>`;
+
+  const safeDocTitle = escapeHtml(documentTitle || 'Document');
+  const plainButtonLabel = (buttonText || 'Review & Sign Document')
+    .replace(/&ldquo;/g, '"')
+    .replace(/&rdquo;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/<[^>]*>/g, '');
 
   const buttonHtml = showButton && actionUrl ? `
     <tr>
-      <td style="padding:28px 40px;">
+      <td style="padding:8px 40px 28px;">
         <table cellpadding="0" cellspacing="0" width="100%">
           <tr>
             <td align="center">
+              <!--[if mso]>
+              <v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" href="${actionUrl}"
+                style="height:48px;v-text-anchor:middle;width:320px;" arcsize="12%" stroke="f" fillcolor="#0284c7">
+                <w:anchorlock/>
+                <center style="color:#ffffff;font-family:sans-serif;font-size:15px;font-weight:bold;">
+                  ${plainButtonLabel}
+                </center>
+              </v:roundrect>
+              <![endif]-->
+              <!--[if !mso]><!-->
               <a href="${actionUrl}"
-                 style="display:inline-block;background:linear-gradient(135deg,#28ABDF 0%,#1d8fbf 100%);
-                        color:#ffffff;text-decoration:none;font-size:15px;font-weight:700;
-                        padding:15px 44px;border-radius:10px;letter-spacing:0.3px;
-                        box-shadow:0 4px 14px rgba(40,171,223,0.35);">
+                 style="display:inline-block;background-color:#0284c7;color:#ffffff;text-decoration:none;
+                        font-size:15px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+                        padding:14px 36px;border-radius:8px;letter-spacing:0.2px;mso-padding-alt:0;">
                 ${buttonText}
               </a>
+              <!--<![endif]-->
             </td>
           </tr>
           <tr>
-            <td align="center" style="padding-top:14px;font-size:12px;color:#94a3b8;">
-              Or copy this link:<br/>
-              <span style="color:#28ABDF;font-size:11px;word-break:break-all;">${actionUrl}</span>
+            <td align="center" style="padding-top:16px;font-size:12px;color:#64748b;line-height:1.6;
+                                       font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+              Or open the secure signing page for<br/>
+              <a href="${actionUrl}" style="color:#0284c7;font-size:13px;font-weight:600;text-decoration:underline;">${safeDocTitle}</a>
             </td>
           </tr>
         </table>
@@ -2530,18 +2858,26 @@ function buildEmailHtml(opts) {
     <tr>
       <td style="padding:0 40px 24px;">
         <table width="100%" cellpadding="0" cellspacing="0"
-               style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px 18px;">
+               style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;">
           <tr>
-            <td>
-              <p style="margin:0;font-size:13px;color:#166534;font-weight:700;">Signed PDF attached</p>
-              <p style="margin:4px 0 0;font-size:12px;color:#15803d;">
-                "${documentTitle}.pdf" is attached to this email. Please save it for your records.
+            <td style="padding:16px 20px;">
+              <p style="margin:0;font-size:13px;color:#166534;font-weight:700;
+                        font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                Signed Document Attached
+              </p>
+              <p style="margin:6px 0 0;font-size:13px;color:#15803d;line-height:1.6;
+                        font-family:Georgia,'Times New Roman',Times,serif;">
+                &ldquo;${escapeHtml(documentTitle)}&rdquo; is attached to this email. Please save it for your records.
               </p>
             </td>
           </tr>
         </table>
       </td>
     </tr>` : '';
+
+  const senderDisplay = senderDesignation
+    ? `${escapeHtml(senderName)}, ${escapeHtml(senderDesignation)}`
+    : escapeHtml(senderName);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -2566,72 +2902,82 @@ function buildEmailHtml(opts) {
 
         <!-- HEADER: Company branding -->
         <tr>
-          <td style="background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);padding:24px 40px;">
+          <td bgcolor="${headerBg}" style="background-color:${headerBg};padding:24px 40px;">
             <table width="100%" cellpadding="0" cellspacing="0">
               <tr>
                 <td style="vertical-align:middle;">${logoHtml}</td>
                 <td style="vertical-align:middle;text-align:right;">
-                  <span style="color:#94a3b8;font-size:12px;font-weight:600;">${companyName}</span>
+                  <span style="color:${headerText};font-size:13px;font-weight:700;">${companyName}</span>
                 </td>
               </tr>
             </table>
           </td>
         </tr>
 
-        <!-- HERO SECTION -->
+        <!-- BODY -->
         <tr>
-          <td style="padding:40px 40px 0;">
-            <div style="width:56px;height:56px;border-radius:14px;background:${iconBg};
-                        margin-bottom:20px;display:inline-flex;align-items:center;justify-content:center;">
-              ${getHeroIconHtml(heroIcon)}
-            </div>
-            <h1 style="margin:0 0 12px;font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;">
+          <td style="padding:36px 40px 0;">
+            <h1 style="margin:0 0 20px;font-size:20px;font-weight:700;color:#0f172a;line-height:1.35;
+                       font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
               ${heroTitle}
             </h1>
-            <p style="margin:0 0 28px;font-size:15px;color:#64748b;line-height:1.75;">
-              ${heroMessage}
-            </p>
+            ${bodyHtml}
+            ${customMessageBlock}
           </td>
         </tr>
 
-        <!-- DOCUMENT CARD -->
+        <!-- DOCUMENT DETAILS -->
         <tr>
-          <td style="padding:0 40px 28px;">
+          <td style="padding:28px 40px;">
+            <p style="margin:0 0 12px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;
+                      letter-spacing:0.6px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+              Document Details
+            </p>
             <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+                   style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;">
               <tr>
-                <td style="padding:20px 24px;">
-                  <table cellpadding="0" cellspacing="0">
-                    <tr>
-                      <td style="vertical-align:middle;padding-right:14px;">
-                        <div style="width:40px;height:40px;background:#eff6ff;border-radius:10px;
-                                    text-align:center;line-height:40px;font-size:18px;">
-                          &#x1F4C4;
-                        </div>
-                      </td>
-                      <td style="vertical-align:middle;">
-                        <p style="margin:0;font-size:15px;font-weight:700;color:#0f172a;">${documentTitle}</p>
-                        <p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">
-                          ${documentSubtitle} &middot; Sent by ${senderName}
-                        </p>
-                      </td>
-                    </tr>
-                  </table>
+                <td style="padding:18px 22px;border-bottom:1px solid #e2e8f0;">
+                  <p style="margin:0;font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;
+                            letter-spacing:0.4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                    Document Title
+                  </p>
+                  <p style="margin:4px 0 0;font-size:16px;font-weight:700;color:#0f172a;
+                            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                    ${escapeHtml(documentTitle)}
+                  </p>
+                  <p style="margin:4px 0 0;font-size:13px;color:#64748b;
+                            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                    ${escapeHtml(documentSubtitle)}
+                  </p>
                 </td>
               </tr>
               <tr>
-                <td style="border-top:1px solid #e2e8f0;padding:14px 24px;">
+                <td style="padding:14px 22px;">
                   <table width="100%" cellpadding="0" cellspacing="0">
                     <tr>
-                      <td style="font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Sent By</td>
-                      <td style="font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;text-align:right;">Expires</td>
-                    </tr>
-                    <tr>
-                      <td style="font-size:13px;color:#334155;font-weight:600;padding-top:3px;">
-                        ${senderName} &middot; ${companyName}
+                      <td width="50%" style="vertical-align:top;">
+                        <p style="margin:0;font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;
+                                  letter-spacing:0.4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                          Requested By
+                        </p>
+                        <p style="margin:4px 0 0;font-size:13px;color:#334155;font-weight:600;
+                                  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                          ${senderDisplay}
+                        </p>
+                        <p style="margin:2px 0 0;font-size:12px;color:#64748b;
+                                  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                          ${escapeHtml(companyName)}
+                        </p>
                       </td>
-                      <td style="font-size:13px;color:#334155;font-weight:600;padding-top:3px;text-align:right;">
-                        ${expiryDate}
+                      <td width="50%" style="vertical-align:top;text-align:right;">
+                        <p style="margin:0;font-size:11px;color:#94a3b8;font-weight:600;text-transform:uppercase;
+                                  letter-spacing:0.4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                          Link Expires
+                        </p>
+                        <p style="margin:4px 0 0;font-size:13px;color:#334155;font-weight:600;
+                                  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                          ${expiryDate}
+                        </p>
                       </td>
                     </tr>
                   </table>
@@ -2647,17 +2993,30 @@ function buildEmailHtml(opts) {
         <!-- PDF BADGE -->
         ${pdfBadgeHtml}
 
+        <!-- CLOSING SIGNATURE -->
+        ${closingHtml ? `
+        <tr>
+          <td style="padding:0 40px 8px;">
+            ${closingHtml}
+          </td>
+        </tr>` : ''}
+
         <!-- SECURITY NOTE -->
         <tr>
           <td style="padding:0 40px 28px;">
             <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:14px 18px;">
+                   style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;">
               <tr>
-                <td>
-                  <p style="margin:0;font-size:12px;color:#92400e;font-weight:700;">&#x1F512; Secure &amp; Legally Binding</p>
-                  <p style="margin:4px 0 0;font-size:11px;color:#b45309;line-height:1.6;">
-                    This document is protected by NexSign's audit trail. Your signature is legally binding and timestamped.
-                    If you did not expect this email, please ignore it.
+                <td style="padding:16px 20px;">
+                  <p style="margin:0;font-size:12px;color:#475569;font-weight:700;
+                            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                    Security Notice
+                  </p>
+                  <p style="margin:6px 0 0;font-size:12px;color:#64748b;line-height:1.7;
+                            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                    This request was sent through NexSign&rsquo;s secure electronic signature platform.
+                    Your signature is legally binding and recorded with a complete audit trail.
+                    If you did not expect this email, you may safely disregard it.
                   </p>
                 </td>
               </tr>
@@ -2696,12 +3055,15 @@ function buildEmailHtml(opts) {
                 </td>
               </tr>
               <tr>
-                <td colspan="2" style="padding-top:16px;font-size:10px;color:#cbd5e1;text-align:center;line-height:1.7;">
-                  &copy; ${new Date().getFullYear()} ${companyName} &middot; All rights reserved<br/>
-                  Powered by <a href="https://nexsign.app" style="color:#28ABDF;text-decoration:none;font-weight:600;">NexSign</a>
-                  &middot; Electronic Signature Platform<br/>
-                  <span style="color:#e2e8f0;">
-                    You received this because ${senderName} used NexSign to request your signature.
+                <td colspan="2" style="padding-top:20px;border-top:1px solid #e2e8f0;font-size:11px;
+                                       color:#64748b;text-align:center;line-height:1.75;
+                                       font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                  &copy; ${new Date().getFullYear()} ${escapeHtml(companyName)}. All rights reserved.<br/>
+                  Sent securely via
+                  <a href="https://nexsign.app" style="color:#0284c7;text-decoration:none;font-weight:600;">NexSign</a>
+                  &mdash; Electronic Signature Platform<br/>
+                  <span style="color:#475569;font-size:10px;">
+                    You received this message because ${escapeHtml(senderName)} initiated a signing request through NexSign.
                   </span>
                 </td>
               </tr>
@@ -2718,6 +3080,84 @@ function buildEmailHtml(opts) {
 </html>`;
 }
 
+// ─── Build email HTML + subject (shared by send + preview) ───────────────────
+function composeEmail(type, data, attachments = []) {
+  const config = EMAIL_CONFIG[type];
+  if (!config) throw new Error(`[emailService] Unknown email type: ${type}`);
+
+  const docSubtitle = data.docSubtitle || getDocumentSubtitle(data.docTitle || '');
+  const expiryDate  = data.expiryDate  || (() => {
+    const d = new Date(); d.setDate(d.getDate() + 30);
+    return d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  })();
+
+  const senderName = data.senderName || data.bossName || 'NexSign';
+  const actionUrl  = data.actionUrl || data.signingLink || '';
+
+  const useCustomBody = !!(data.useCustomEmailBody && String(data.customEmailBody || '').trim());
+
+  let bodyHtml = '';
+  let customMessageBlock = '';
+  let closingHtml = '';
+  let showButton = config.showButton;
+  let subject = config.subject({ ...data, expiryDate });
+
+  if (useCustomBody) {
+    const resolvedBody = applyEmailTokens(data.customEmailBody, { ...data, expiryDate, actionUrl, signingLink: actionUrl });
+    bodyHtml = `<div style="margin:0 0 8px;font-size:15px;color:#334155;line-height:1.85;
+                              font-family:Georgia,'Times New Roman',Times,serif;">${customBodyToHtml(resolvedBody)}</div>`;
+    if (data.customEmailSubject?.trim()) {
+      subject = applyEmailTokens(data.customEmailSubject, { ...data, expiryDate, actionUrl, signingLink: actionUrl });
+    }
+    if (customBodyHasLink(data.customEmailBody, actionUrl)) {
+      showButton = false;
+    }
+  } else {
+    bodyHtml = config.bodyParagraphs
+      ? formatBodyParagraphs(config.bodyParagraphs({ ...data, expiryDate }))
+      : '';
+    customMessageBlock = buildCustomMessageBlock(
+      data.customMessage || data.message,
+      senderName,
+    );
+    closingHtml = config.closingLine
+      ? buildClosingBlock(config.closingLine({ ...data, expiryDate }))
+      : '';
+  }
+
+  const buttonText = typeof config.buttonText === 'function'
+    ? config.buttonText({ ...data, expiryDate })
+    : (config.buttonText || 'Review &amp; Sign Document');
+
+  const html = buildEmailHtml({
+    subject,
+    heroTitle:        config.heroTitle({ ...data, expiryDate }),
+    bodyHtml,
+    customMessageBlock,
+    closingHtml,
+    buttonText,
+    showButton,
+    hasPdf:           config.hasPdf,
+    actionUrl,
+    documentTitle:    data.docTitle || data.documentTitle || 'Document',
+    documentSubtitle: docSubtitle,
+    senderName,
+    senderDesignation: data.senderDesignation || data.bossDesignation || '',
+    companyName:      data.companyName || 'NexSign',
+    companyLogo:      data.companyLogo || data.companyLogoUrl || '',
+    companyInitial:   (data.companyName || 'N')[0].toUpperCase(),
+    expiryDate,
+    emailHeaderColor: data.emailHeaderColor || '#0f172a',
+  });
+
+  return { subject, html, config, attachments };
+}
+
+function buildEmailPreview(type, data) {
+  const { subject, html } = composeEmail(type, data);
+  return { subject, html };
+}
+
 // ─── Main send function ───────────────────────────────────────────────────────
 /**
  * @param {string}  type        - one of the EMAIL_CONFIG keys
@@ -2725,50 +3165,25 @@ function buildEmailHtml(opts) {
  * @param {Array}   attachments - nodemailer attachment objects [{filename, content, contentType}]
  */
 async function sendEmail(type, data, attachments = []) {
-  const config = EMAIL_CONFIG[type];
-  if (!config) throw new Error(`[emailService] Unknown email type: ${type}`);
-
-  const docSubtitle = data.docSubtitle || getDocumentSubtitle(data.docTitle || '');
-  const expiryDate  = data.expiryDate  || (() => {
-    const d = new Date(); d.setDate(d.getDate() + 7);
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-  })();
-
-  const html = buildEmailHtml({
-    subject:          config.subject(data),
-    heroIcon:         config.heroIcon,
-    iconBg:           config.iconBg,
-    heroTitle:        config.heroTitle(data),
-    heroMessage:      config.heroMessage(data),
-    buttonText:       config.buttonText  || '',
-    showButton:       config.showButton,
-    hasPdf:           config.hasPdf,
-    actionUrl:        data.actionUrl     || '',
-    documentTitle:    data.docTitle      || 'Document',
-    documentSubtitle: docSubtitle,
-    senderName:       data.senderName    || data.bossName || 'NexSign',
-    signerName:       data.signerName    || data.ccName   || 'Recipient',
-    companyName:      data.companyName   || 'NexSign',
-    companyLogo:      data.companyLogo   || '',
-    companyInitial:   (data.companyName  || 'N')[0].toUpperCase(),
-    expiryDate,
-  });
-
-  const subject = config.subject(data);
+  let subject = '';
+  let html    = '';
 
   try {
+    ({ subject, html } = composeEmail(type, data, attachments));
+
     await transporter.sendMail({
       from:        `"${data.companyName || 'NexSign'} via NexSign" <${process.env.SMTP_USER || process.env.SMTP_FROM || 'noreply@nexsign.app'}>`,
-      replyTo:     data.senderEmail || undefined,
+      replyTo:     data.senderEmail || data.bossEmail || undefined,
       to:          data.to,
       subject,
       html,
       attachments,
     });
     console.log(`[emailService] Sent '${type}' to ${data.to} | Subject: ${subject}`);
+    return { success: true, to: data.to, subject };
   } catch (err) {
     console.error(`[emailService] ERROR sending '${type}' to ${data.to}:`, err.message);
-    // Don't rethrow to avoid crashing Vercel functions if one email fails
+    return { success: false, to: data.to, subject, error: err.message };
   }
 }
 
@@ -2778,38 +3193,107 @@ async function sendEmail(type, data, attachments = []) {
 
 async function sendSigningEmail(data) {
   return sendEmail('signing_request', {
-    to:          data.recipientEmail,
-    signerName:  data.recipientName,
-    senderName:  data.senderName,
-    senderEmail: data.senderEmail,
-    docTitle:    data.documentTitle,
-    actionUrl:   data.signingLink || data.actionUrl,
-    companyLogo: data.companyLogoUrl,
-    companyName: data.companyName || 'NexSign',
+    to:                data.recipientEmail,
+    signerName:        data.recipientName,
+    senderName:        data.senderName,
+    senderDesignation: data.senderDesignation || '',
+    senderEmail:       data.senderEmail,
+    docTitle:          data.documentTitle,
+    actionUrl:         data.signingLink || data.actionUrl,
+    companyLogo:       data.companyLogoUrl || data.companyLogo,
+    companyName:       data.companyName || 'NexSign',
+    emailHeaderColor:  data.emailHeaderColor,
+    customMessage:     data.message,
+    partyNumber:       data.partyNumber,
+    totalParties:      data.totalParties,
+    useCustomEmailBody: data.useCustomEmailBody,
+    customEmailBody:    data.customEmailBody,
+    customEmailSubject: data.customEmailSubject,
   });
 }
 
 async function sendBossApprovalEmail(data) {
   return sendEmail('signing_request', {
-    to:          data.bossEmail,
-    signerName:  data.bossName,
-    senderName:  data.senderName || data.bossName,
-    docTitle:    data.documentTitle,
-    actionUrl:   data.signingLink,
-    companyLogo: data.companyLogoUrl,
-    companyName: data.companyName || 'NexSign',
+    to:                data.bossEmail,
+    signerName:        data.bossName,
+    senderName:        data.senderName || data.bossName,
+    senderDesignation: data.senderDesignation || '',
+    docTitle:          data.documentTitle,
+    actionUrl:         data.signingLink,
+    companyLogo:       data.companyLogoUrl || data.companyLogo,
+    companyName:       data.companyName || 'NexSign',
+    emailHeaderColor:  data.emailHeaderColor,
+    customMessage:     data.message,
   });
 }
 
 async function sendEmployeeSigningEmail(data) {
-  return sendEmail('signing_request', {
-    to:          data.employeeEmail,
-    signerName:  data.employeeName,
-    senderName:  data.bossName,
-    docTitle:    data.documentTitle,
-    actionUrl:   data.signingLink,
-    companyLogo: data.companyLogoUrl,
-    companyName: data.companyName || 'NexSign',
+  return sendEmail('employee_signing_request', {
+    to:                  data.employeeEmail || data.to,
+    employeeName:        data.employeeName,
+    employeeDesignation: data.employeeDesignation || '',
+    bossName:            data.bossName,
+    bossDesignation:     data.bossDesignation || '',
+    senderEmail:         data.senderEmail || data.bossEmail,
+    docTitle:            data.documentTitle || data.docTitle,
+    actionUrl:           data.signingLink || data.actionUrl,
+    companyLogo:         data.companyLogoUrl || data.companyLogo,
+    companyName:         data.companyName || 'NexSign',
+    emailHeaderColor:    data.emailHeaderColor,
+    customMessage:       data.message || data.customMessage,
+    expiryDate:          data.expiryDate,
+    useCustomEmailBody:  data.useCustomEmailBody,
+    customEmailBody:     data.customEmailBody,
+    customEmailSubject:  data.customEmailSubject,
+  });
+}
+
+async function sendCampaignBossEmail(data) {
+  return sendEmail('campaign_boss_sign', {
+    to:               data.bossEmail,
+    signerName:       data.bossName,
+    docTitle:         data.documentTitle || data.docTitle,
+    actionUrl:        data.signingLink || data.actionUrl,
+    companyName:      data.companyName || 'NexSign',
+    companyLogo:      data.companyLogoUrl || data.companyLogo,
+    emailHeaderColor: data.emailHeaderColor,
+    ownerName:        data.ownerName,
+    employeeCount:    data.employeeCount || 0,
+    approverCount:    data.approverCount || 0,
+  });
+}
+
+async function sendCampaignApproverEmail(data) {
+  return sendEmail('campaign_approver', {
+    to:                  data.approverEmail || data.to,
+    signerName:          data.approverName,
+    employeeDesignation: data.approverDesignation || '',
+    docTitle:            data.documentTitle || data.docTitle,
+    actionUrl:           data.approvalLink || data.actionUrl,
+    companyName:         data.companyName || 'NexSign',
+    companyLogo:         data.companyLogoUrl || data.companyLogo,
+    emailHeaderColor:    data.emailHeaderColor,
+    stepNumber:          data.stepNumber || 1,
+    totalSteps:          data.totalSteps || 1,
+    isLastApprover:      !!data.isLastApprover,
+    previousApprovers:   data.previousApprovers || '',
+  });
+}
+
+async function sendEmailDeliveryFailureNotice(data) {
+  const failedListHtml = (data.failed || [])
+    .map(f => `<li style="margin-bottom:6px;"><strong>${escapeHtml(f.name || 'Unknown')}</strong> &mdash; ${escapeHtml(f.email)}${f.error ? `<br/><span style="color:#94a3b8;font-size:11px;">${escapeHtml(f.error)}</span>` : ''}</li>`)
+    .join('');
+
+  return sendEmail('email_delivery_failure', {
+    to:             data.ownerEmail,
+    ownerName:      data.ownerName,
+    docTitle:       data.docTitle || data.documentTitle,
+    failedCount:    data.failed?.length || 0,
+    totalCount:     data.totalCount || 0,
+    failedListHtml: `<ul style="margin:12px 0 16px 20px;padding:0;color:#334155;font-size:14px;line-height:1.6;">${failedListHtml}</ul>`,
+    companyName:    'NexSign',
+    emailHeaderColor: '#0f172a',
   });
 }
 
@@ -2828,30 +3312,102 @@ async function sendCompletionEmail(data) {
   const attachments = [];
   if (data.pdfBuffer) {
     attachments.push({
-      filename: `${data.documentTitle || 'document'}_signed.pdf`,
+      filename: `${(data.documentTitle || 'document').replace(/[^a-zA-Z0-9._-]/g, '_')}_signed.pdf`,
       content:  data.pdfBuffer,
+      contentType: 'application/pdf',
     });
   }
 
+  let auditNote = '';
+  if (Array.isArray(data.parties) && data.parties.length) {
+    auditNote = data.parties.map((p, i) => {
+      const loc = [p.city, p.region, p.country, p.postalCode].filter(Boolean).join(', ') || 'N/A';
+      const dev = [p.device, p.browser, p.os].filter(Boolean).join(' / ') || 'N/A';
+      return [
+        `${i + 1}. ${p.name || 'Signer'} (${p.email || ''})`,
+        `   Signed: ${p.localSignedTime || p.signedAt || 'N/A'}`,
+        `   Location: ${loc}`,
+        `   IP: ${p.ipAddress || p.ip || 'N/A'} · Device: ${dev}`,
+        p.latitude && p.longitude ? `   GPS: ${p.latitude}, ${p.longitude}` : '',
+      ].filter(Boolean).join('\n');
+    }).join('\n\n');
+    auditNote += '\n\nA Certificate of Completion (legal audit trail) is included as the final page of the attached PDF.';
+  }
+
   return sendEmail(data.isCC ? 'cc_notification' : 'completion', {
-    to:          data.recipientEmail,
-    signerName:  data.recipientName,
-    docTitle:    data.documentTitle,
-    signedPdfUrl: data.signedPdfUrl,
-    companyLogo: data.companyLogoUrl,
-    companyName: data.companyName || 'NexSign',
+    to:               data.recipientEmail,
+    signerName:       data.recipientName,
+    ccName:           data.recipientName,
+    senderName:       data.senderName || data.companyName,
+    docTitle:         data.documentTitle,
+    signedPdfUrl:     data.signedPdfUrl,
+    companyLogo:      data.companyLogoUrl,
+    companyName:      data.companyName || 'NexSign',
+    emailHeaderColor: data.emailHeaderColor,
+    customMessage:    auditNote,
   }, attachments);
 }
 
 async function sendCCEmail(data) {
   return sendEmail('cc_notification', {
-    to:          data.recipientEmail,
-    signerName:  data.recipientName || data.ccName,
-    ccName:      data.recipientName,
-    senderName:  data.senderName,
-    docTitle:    data.documentTitle,
-    companyLogo: data.companyLogoUrl,
-    companyName: data.companyName || 'NexSign',
+    to:               data.recipientEmail,
+    signerName:       data.recipientName,
+    ccName:           data.recipientName || data.ccName,
+    senderName:       data.senderName,
+    senderDesignation: data.senderDesignation || '',
+    docTitle:         data.documentTitle,
+    companyLogo:      data.companyLogoUrl,
+    companyName:      data.companyName || 'NexSign',
+    emailHeaderColor: data.emailHeaderColor,
+  });
+}
+
+async function sendFeedbackEmail(userEmail, userName, stars, message = '') {
+  const rating = Math.min(Math.max(Number(stars) || 0, 1), 5);
+  const cleanEmail = String(userEmail || '').trim().toLowerCase();
+  const cleanName  = String(userName || 'User').trim().slice(0, 80);
+  const cleanMsg   = String(message || '').trim().slice(0, 1000);
+
+  if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    throw new Error('Valid email is required.');
+  }
+
+  const starDisplay = '★'.repeat(rating) + '☆'.repeat(5 - rating);
+  const adminInbox  = process.env.SMTP_USER || process.env.EMAIL_USER;
+
+  const html = buildEmailHtml({
+    subject:          `NexSign Feedback — ${rating}/5 from ${cleanName}`,
+    heroTitle:        'New Feedback Received',
+    bodyHtml:         formatBodyParagraphs([
+      `A user submitted feedback through the NexSign website.`,
+      `<strong>Name:</strong> ${escapeHtml(cleanName)}<br/>
+       <strong>Email:</strong> ${escapeHtml(cleanEmail)}<br/>
+       <strong>Rating:</strong> ${starDisplay} (${rating}/5)`,
+      cleanMsg ? `<strong>Message:</strong><br/>${escapeHtml(cleanMsg).replace(/\n/g, '<br/>')}` : '',
+    ].filter(Boolean)),
+    customMessageBlock: '',
+    closingHtml:      '',
+    buttonText:       '',
+    showButton:       false,
+    hasPdf:           false,
+    actionUrl:        '',
+    documentTitle:    'Website Feedback',
+    documentSubtitle: 'User submission',
+    senderName:       cleanName,
+    senderDesignation: '',
+    companyName:      'NexSign',
+    companyLogo:      '',
+    companyInitial:   'N',
+    expiryDate:       new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
+    emailHeaderColor: '#0f172a',
+  });
+
+  await transporter.sendMail({
+    from:    `"NexSign" <${adminInbox}>`,
+    to:      adminInbox,
+    replyTo: cleanEmail,
+    subject: `NexSign Feedback — ${rating}/5 stars from ${cleanName}`,
+    html,
   });
 }
 
@@ -2860,10 +3416,17 @@ module.exports = {
   sendSigningEmail,
   sendBossApprovalEmail,
   sendEmployeeSigningEmail,
+  sendEmailDeliveryFailureNotice,
+  sendCampaignBossEmail,
+  sendCampaignApproverEmail,
   sendDeclinedEmail,
   sendCompletionEmail,
   sendCCEmail,
+  sendFeedbackEmail,
   EMAIL_CONFIG,
   getDocumentSubtitle,
   buildEmailHtml,
+  buildEmailPreview,
+  composeEmail,
+  applyEmailTokens,
 };

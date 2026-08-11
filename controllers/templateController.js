@@ -5,6 +5,7 @@ const crypto          = require('crypto');
 const { v2: cloudinary } = require('cloudinary');
 const Template        = require('../models/Template');
 const TemplateSession = require('../models/TemplateSession');
+const TemplateCampaign = require('../models/TemplateCampaign');
 const User            = require('../models/User');
 const AuditLog        = require('../models/AuditLog');
 
@@ -24,13 +25,187 @@ try {
   console.warn('[templateController] emailService not found:', e.message);
 }
 
+const { getPdfBytes, sendPdf, savePdfBuffer } = require('../utils/pdfStorage');
+const {
+  resolveSigningLocation,
+  toAuditLocation,
+  toSignerAuditFields,
+} = require('../utils/geoService');
+
 const {
   sendBossApprovalEmail,
   sendEmployeeSigningEmail,
+  sendEmailDeliveryFailureNotice,
   sendCompletionEmail,
   sendCCEmail,
   sendDeclinedEmail,
+  sendCampaignApproverEmail,
+  buildEmailPreview,
 } = emailService;
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/** Send one employee signing email with one automatic retry */
+async function dispatchEmployeeEmail({ session, template, bossUser }) {
+  const expiryDays = template.signingConfig?.expiryDays || 30;
+  const expiryDate = new Date(Date.now() + expiryDays * 86_400_000)
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+
+  const sc = template.signingConfig || {};
+  const useCustom = !!(template.useCustomEmailBody || sc.useCustomEmailBody);
+  const customBody = template.customEmailBody || sc.customEmailBody || '';
+  const customSubject = template.customEmailSubject || sc.customEmailSubject || '';
+
+  const payload = {
+    employeeEmail:       session.recipientEmail,
+    employeeName:        session.recipientName,
+    employeeDesignation: session.recipientDesignation || '',
+    documentTitle:       template.title,
+    signingLink:         `${FRONT()}/template-sign/${session.token}`,
+    bossName:            bossUser.full_name || bossUser.name || 'Your Manager',
+    bossDesignation:     bossUser.designation || '',
+    bossEmail:           bossUser.email,
+    companyName:         template.companyName || '',
+    companyLogoUrl:      template.companyLogo || bossUser.company_logo || '',
+    emailHeaderColor:    template.emailHeaderColor || '#0f172a',
+    message:             template.message || sc.emailMessage || '',
+    expiryDate,
+    useCustomEmailBody:  useCustom,
+    customEmailBody:     customBody,
+    customEmailSubject:  customSubject,
+  };
+
+  let result = await sendEmployeeSigningEmail?.(payload);
+  if (!result?.success) {
+    await sleep(2000);
+    result = await sendEmployeeSigningEmail?.(payload);
+  }
+  return result || { success: false, error: 'Email service unavailable' };
+}
+
+async function recordSessionEmailResult(session, result) {
+  session.emailAttempts = (session.emailAttempts || 0) + 1;
+  session.lastEmailAttemptAt = new Date();
+  if (result?.success) {
+    session.emailDelivered = true;
+    session.emailError     = '';
+    session.sentAt         = session.sentAt || new Date();
+    session.addAuditEntry('link_sent', {
+      note: `Email delivered to ${session.recipientEmail}`,
+    });
+  } else {
+    session.emailDelivered = false;
+    session.emailError     = result?.error || 'Delivery failed';
+    session.addAuditEntry('link_sent', {
+      note: `Email FAILED for ${session.recipientEmail}: ${session.emailError}`,
+    });
+  }
+  await session.save();
+}
+
+async function emailTemplateApprover(template, ownerUser) {
+  const idx = template.currentApproverIndex;
+  const approver = template.approvers?.[idx];
+  if (!approver || approver.status !== 'pending') return;
+
+  const previous = template.approvers
+    .slice(0, idx)
+    .filter(a => a.status === 'approved')
+    .map(a => a.name)
+    .join(', ');
+
+  await sendCampaignApproverEmail?.({
+    approverEmail:       approver.email,
+    approverName:        approver.name,
+    approverDesignation: approver.designation || '',
+    documentTitle:       template.title,
+    approvalLink:        `${FRONT()}/template-campaign/approve/${approver.token}`,
+    companyName:         template.companyName,
+    companyLogoUrl:      template.companyLogo,
+    emailHeaderColor:    template.emailHeaderColor,
+    stepNumber:          idx + 1,
+    totalSteps:          template.approvers.length,
+    isLastApprover:      idx === template.approvers.length - 1,
+    previousApprovers:   previous,
+    ownerName:           ownerUser?.full_name || ownerUser?.name,
+  });
+}
+
+/** Create sessions + email all template recipients (master template batch) */
+async function distributeTemplateEmployees(template, bossUser, req) {
+  const expiryDays = template.signingConfig?.expiryDays || 30;
+  const expiresAt  = new Date(Date.now() + expiryDays * 86_400_000);
+
+  const sessionDocs = template.recipients.map(r => ({
+    template:             template._id,
+    recipientName:        r.name,
+    recipientEmail:       r.email,
+    recipientDesignation: r.designation || '',
+    token:                generateToken(),
+    status:               'pending',
+    expiresAt,
+    sentAt:               new Date(),
+    auditLog: [{
+      action:    'link_sent',
+      timestamp: new Date(),
+      note:      'Session created — sending email',
+    }],
+  }));
+
+  const sessions = await TemplateSession.insertMany(sessionDocs);
+  const failed = [];
+  let emailsSent = 0;
+
+  for (const session of sessions) {
+    const result = await dispatchEmployeeEmail({ session, template, bossUser });
+    await recordSessionEmailResult(session, result);
+    if (result?.success) emailsSent += 1;
+    else {
+      failed.push({
+        name:  session.recipientName,
+        email: session.recipientEmail,
+        error: result?.error || 'Unknown error',
+      });
+    }
+  }
+
+  template.status = 'active';
+  template.sentAt = template.sentAt || new Date();
+  template.currentApproverIndex = -1;
+  await template.save();
+
+  if (failed.length) {
+    try {
+      await sendEmailDeliveryFailureNotice?.({
+        ownerEmail:   bossUser.email,
+        ownerName:    bossUser.full_name || bossUser.name || 'Template Owner',
+        docTitle:     template.title,
+        failed,
+        totalCount:   sessions.length,
+      });
+    } catch (noticeErr) {
+      console.error('[distributeTemplateEmployees] Owner notice failed:', noticeErr.message);
+    }
+
+    emitSocket(req, 'template:email_failed', {
+      templateId: String(template._id),
+      ownerId:    String(bossUser._id || bossUser.id),
+      failed,
+      emailsSent,
+      totalCount: sessions.length,
+    });
+  }
+
+  emitSocket(req, 'template:activated', {
+    templateId:  String(template._id),
+    ownerId:     String(bossUser._id || bossUser.id),
+    title:       template.title,
+    totalCount:  sessions.length,
+    emailsSent,
+  });
+
+  return { phase: 'active', emailsSent, emailsFailed: failed.length, failedRecipients: failed };
+}
 
 // ════════════════════════════════════════════════════
 // HELPERS
@@ -146,14 +321,21 @@ const FRONT = () =>
 // ── Safe audit log ────────────────────────────────
 async function safeAuditLog(payload) {
   try {
+    const loc = payload.location || {};
+    const normalized = loc.ip_address || loc.city
+      ? (loc.ip_address ? loc : toAuditLocation(loc, loc.ip || loc.ip_address))
+      : toAuditLocation(loc, null);
+
     await AuditLog.create({
       document_id:        payload.document_id    || null,
       document_title:     payload.document_title || null,
+      template_id:        payload.template_id    || null,
+      session_id:         payload.session_id     || null,
       is_template_action: true,
       action:             payload.action,
       performed_by:       payload.performed_by   || {},
       device:             payload.device         || {},
-      location:           payload.location       || {},
+      location:           normalized,
       local_time:         payload.local_time     || null,
     });
   } catch (e) {
@@ -193,7 +375,8 @@ const createTemplate = asyncHandler(async (req, res) => {
     fields,                    // ✅ unified fields array (assignedTo: boss/employee)
     recipients, ccList,
     signingConfig, totalPages,
-    companyName, companyLogo, message,
+    companyName, companyLogo, message, emailHeaderColor,
+    approvers: approversRaw,
   } = req.body;
 
   // ── Validation ────────────────────────────────────
@@ -216,6 +399,17 @@ const createTemplate = asyncHandler(async (req, res) => {
   const parsedConfig     = signingConfig || {};
   const bossSignsFirst   = parsedConfig.bossSignsFirst !== false;
 
+  const parsedApprovers = (Array.isArray(approversRaw) ? approversRaw : [])
+    .map((a, i) => ({
+      name:        String(a.name || '').trim(),
+      email:       String(a.email || '').trim().toLowerCase(),
+      designation: String(a.designation || '').trim(),
+      order:       i,
+      token:       generateToken(),
+      status:      'pending',
+    }))
+    .filter(a => a.name && a.email);
+
   const template = await Template.create({
     title:        title.trim(),
     description:  description || '',
@@ -228,7 +422,8 @@ const createTemplate = asyncHandler(async (req, res) => {
     recipients:   parsedRecipients,
     ccList:       parsedCC,
     companyName:  companyName  || '',
-    companyLogo:  companyLogo  || '',
+    companyLogo:  companyLogo || req.user.company_logo || '',
+    emailHeaderColor: emailHeaderColor || '#0f172a',
     message:      message      || '',
     signingConfig: {
       bossSignsFirst,
@@ -237,8 +432,12 @@ const createTemplate = asyncHandler(async (req, res) => {
       reminderDays: parsedConfig.reminderDays || 3,
       emailSubject: parsedConfig.emailSubject || '',
       emailMessage: parsedConfig.emailMessage || '',
+      useCustomEmailBody: !!parsedConfig.useCustomEmailBody,
+      customEmailBody:    parsedConfig.customEmailBody    || '',
+      customEmailSubject: parsedConfig.customEmailSubject || '',
     },
     totalPages: Number(totalPages) || 1,
+    approvers:  parsedApprovers,
     status:     bossSignsFirst ? 'boss_pending' : 'active',
     stats: {
       totalRecipients: parsedRecipients.length,
@@ -246,6 +445,14 @@ const createTemplate = asyncHandler(async (req, res) => {
       signed:          0, declined: 0, viewed: 0,
     },
   });
+
+  try {
+    const bytes = await getPdfBytes({ fileUrl: template.fileUrl });
+    template.localPdfPath = savePdfBuffer(bytes, String(template._id));
+    await template.save();
+  } catch (cacheErr) {
+    console.warn('[createTemplate] Could not cache local PDF:', cacheErr.message);
+  }
 
   // Send boss approval email
   if (bossSignsFirst) {
@@ -261,6 +468,7 @@ const createTemplate = asyncHandler(async (req, res) => {
     senderName:    req.user.full_name || req.user.name || 'Boss',
     companyName:   template.companyName || '',
     companyLogoUrl: template.companyLogo || '',
+    emailHeaderColor: template.emailHeaderColor || '#0f172a',
     message:       template.message || '',
   });
     } catch (e) {
@@ -458,16 +666,21 @@ const bossSign = asyncHandler(async (req, res) => {
 
   // ── Step 2: Embed boss signature into PDF ──────────────────
   let bossSignedFileUrl = template.fileUrl; // fallback to original
+  let mergedBytes = null;
   if (pdfService?.embedBossSignature) {
     try {
      // এই পুরো pdfService call টা replace করো:
-const mergedBytes = await Promise.race([
+mergedBytes = await Promise.race([
   pdfService.embedBossSignature({
-    fileUrl:          template.fileUrl,
+    fileUrl: {
+      fileUrl:      template.fileUrl,
+      filePublicId: template.filePublicId,
+      localPdfPath: template.localPdfPath,
+    },
     signatureDataUrl,
-    fields:           (template.fields || [])
-                        .filter(f => f.assignedTo === 'boss'),
-    fieldValues:      Array.isArray(fieldValues) ? fieldValues : [],
+    fields:      (template.fields || [])
+                    .filter(f => f.assignedTo === 'boss'),
+    fieldValues: Array.isArray(fieldValues) ? fieldValues : [],
   }),
   new Promise((_, reject) =>
     setTimeout(() => reject(new Error('embedBossSignature timeout')), 25_000)
@@ -491,6 +704,10 @@ const mergedBytes = await Promise.race([
       bossSignedFileUrl             = pdfResult.secure_url;
       template.bossSignedFileUrl    = bossSignedFileUrl;
       template.bossSignedFilePublicId = pdfResult.public_id;
+      template.localBossSignedPdfPath = savePdfBuffer(
+        Buffer.from(mergedBytes),
+        `boss_${template._id}`,
+      );
 
     } catch (e) {
       console.error('[bossSign] PDF embed failed, using original:', e.message);
@@ -507,12 +724,51 @@ const mergedBytes = await Promise.race([
     signatureImageUrl,
     signedAt:   new Date(),
     ipAddress:  ip,
-    city:       geo.city    || '',
-    country:    geo.country || '',
+    city:       geo?.city    || '',
+    region:     geo?.region  || '',
+    country:    geo?.country || '',
+    postalCode: geo?.postalCode || '',
+    timezone:   geo?.timezone   || '',
+    latitude:   geo?.latitude   || '',
+    longitude:  geo?.longitude  || '',
     device:     deviceInfo.device,
     browser:    deviceInfo.browser,
     os:         deviceInfo.os,
   };
+  await template.save();
+
+  // ── Optional approver chain before employee emails ───────
+  if (template.approvers?.length > 0) {
+    template.status = 'approver_pending';
+    template.currentApproverIndex = 0;
+    await template.save();
+    await emailTemplateApprover(template, req.user);
+
+    safeAuditLog({
+      action:         'boss_signed_template',
+      document_id:    template._id,
+      document_title: template.title,
+      performed_by: {
+        user_id: req.user._id,
+        name:    req.user.full_name || req.user.name,
+        email:   req.user.email,
+        role:    'boss',
+      },
+      device: {
+        device_name: deviceInfo.device,
+        browser:     deviceInfo.browser,
+        os:          deviceInfo.os,
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: `Boss signed! First approver (${template.approvers[0].name}) has been emailed.`,
+      phase:   'approver_pending',
+      template: template.toJSON(),
+    });
+  }
+
   template.status  = 'active';
   template.sentAt  = new Date();
   await template.save();
@@ -533,33 +789,58 @@ const mergedBytes = await Promise.race([
     auditLog: [{
       action:    'link_sent',
       timestamp: new Date(),
-      note:      `Sent by ${req.user.full_name || req.user.email}`,
+      note:      'Session created — sending email',
     }],
   }));
 
   const sessions = await TemplateSession.insertMany(sessionDocs);
 
-  // ── Step 5: Send emails to employees ──────────────────────
-  const emailResults = await Promise.allSettled(
-    sessions.map(session =>
-     sendEmployeeSigningEmail?.({
-    // ✅ FIXED: correct parameter names
-    employeeEmail:   session.recipientEmail,
-    employeeName:    session.recipientName,
-    documentTitle:   template.title,
-    signingLink:     `${FRONT()}/template-sign/${session.token}`,
-    bossName:        req.user.full_name || req.user.name || 'Your Manager',
-    bossDesignation: req.user.designation || '',
-    companyName:     template.companyName || '',
-    companyLogoUrl:  template.companyLogo || '',
-  })
-    )
-  );
+  // ── Step 5: Send emails to ALL employees (with retry + tracking) ──
+  const failed = [];
+  let emailsSent = 0;
 
-  const emailsSent   = emailResults.filter(r => r.status === 'fulfilled').length;
-  const emailsFailed = emailResults.filter(r => r.status === 'rejected').length;
+  for (const session of sessions) {
+    const result = await dispatchEmployeeEmail({
+      session,
+      template,
+      bossUser: req.user,
+    });
+    await recordSessionEmailResult(session, result);
+
+    if (result?.success) {
+      emailsSent += 1;
+    } else {
+      failed.push({
+        name:  session.recipientName,
+        email: session.recipientEmail,
+        error: result?.error || 'Unknown error',
+      });
+    }
+  }
+
+  const emailsFailed = failed.length;
+
   if (emailsFailed > 0) {
-    console.error(`[bossSign] ${emailsFailed} emails failed`);
+    console.error(`[bossSign] ${emailsFailed}/${sessions.length} employee emails failed`);
+    try {
+      await sendEmailDeliveryFailureNotice?.({
+        ownerEmail:   req.user.email,
+        ownerName:    req.user.full_name || req.user.name || 'Template Owner',
+        docTitle:     template.title,
+        failed,
+        totalCount:   sessions.length,
+      });
+    } catch (noticeErr) {
+      console.error('[bossSign] Owner failure notice failed:', noticeErr.message);
+    }
+
+    emitSocket(req, 'template:email_failed', {
+      templateId: String(template._id),
+      ownerId:    String(req.user._id),
+      failed,
+      emailsSent,
+      totalCount: sessions.length,
+    });
   }
 
   // ── Step 6: Emit socket ────────────────────────────────────
@@ -597,9 +878,13 @@ const mergedBytes = await Promise.race([
 
   return res.json({
     success:       true,
-    message:       `Boss signed. ${emailsSent}/${sessions.length} emails sent.`,
+    message:       emailsFailed
+      ? `Boss signed. ${emailsSent}/${sessions.length} emails sent. ${emailsFailed} failed — check your inbox for details.`
+      : `Boss signed. All ${emailsSent} employee emails sent successfully.`,
     sessionsCount: sessions.length,
     emailsSent,
+    emailsFailed,
+    failedRecipients: failed,
     template:      template.toJSON(),
   });
 });
@@ -662,6 +947,373 @@ const getTemplateSessions = asyncHandler(async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════
+// 7b. GET TEMPLATE AUDIT TRAIL
+// GET /api/templates/:id/audit
+// ════════════════════════════════════════════════════
+const getTemplateAudit = asyncHandler(async (req, res) => {
+  const template = await Template.findOne({
+    _id:       req.params.id,
+    owner:     req.user._id,
+    isDeleted: false,
+  }).lean();
+
+  if (!template)
+    return res.status(404).json({ success: false, message: 'Template not found.' });
+
+  const [sessions, dbLogs] = await Promise.all([
+    TemplateSession.find({ template: template._id, isDeleted: { $ne: true } })
+      .select('recipientName recipientEmail recipientDesignation status signedAt viewedAt sentAt declinedAt signingMeta auditLog')
+      .lean(),
+    AuditLog.find({ template_id: template._id })
+      .sort({ timestamp: -1 })
+      .limit(300)
+      .lean(),
+  ]);
+
+  const events = [];
+
+  if (template.bossSignature?.signedAt) {
+    const bs = template.bossSignature;
+    events.push({
+      _id:        `boss-${template._id}`,
+      action:     'boss_signed',
+      label:      'Boss / Authoriser Signed',
+      actorName:  'Authoriser (Boss)',
+      actorEmail: '',
+      timestamp:  bs.signedAt,
+      ip:         bs.ipAddress || '',
+      ipAddress:  bs.ipAddress || '',
+      city:       bs.city || '',
+      region:     bs.region || '',
+      country:    bs.country || '',
+      postalCode: bs.postalCode || '',
+      timezone:   bs.timezone || '',
+      latitude:   bs.latitude || '',
+      longitude:  bs.longitude || '',
+      device:     bs.device || '',
+      browser:    bs.browser || '',
+      os:         bs.os || '',
+      localTime:  bs.signedAt ? new Date(bs.signedAt).toUTCString() : '',
+    });
+  }
+
+  for (const s of sessions) {
+    if (s.sentAt) {
+      events.push({
+        _id:         `sent-${s._id}`,
+        action:      'sent',
+        label:       'Signing Link Sent',
+        actorName:   s.recipientName,
+        actorEmail:  s.recipientEmail,
+        timestamp:   s.sentAt,
+      });
+    }
+    if (s.viewedAt) {
+      events.push({
+        _id:         `viewed-${s._id}`,
+        action:      'viewed',
+        label:       'Link Opened',
+        actorName:   s.recipientName,
+        actorEmail:  s.recipientEmail,
+        timestamp:   s.viewedAt,
+      });
+    }
+    if (s.signedAt) {
+      const loc = s.signingMeta?.location || {};
+      const dev = s.signingMeta?.deviceInfo || {};
+      events.push({
+        _id:         `signed-${s._id}`,
+        action:      'signed',
+        label:       'Employee Signed',
+        actorName:   s.recipientName,
+        actorEmail:  s.recipientEmail,
+        designation: s.recipientDesignation || '',
+        timestamp:   s.signedAt,
+        ip:          s.signingMeta?.ipAddress || '',
+        ipAddress:   s.signingMeta?.ipAddress || '',
+        city:        loc.city || '',
+        region:      loc.region || '',
+        country:     loc.country || '',
+        postalCode:  loc.postalCode || '',
+        timezone:    loc.timezone || '',
+        latitude:    loc.latitude || '',
+        longitude:   loc.longitude || '',
+        device:      dev.device || '',
+        browser:     dev.browser || '',
+        os:          dev.os || '',
+        localTime:   s.signingMeta?.localTime || '',
+        geoSource:   loc.display ? 'resolved' : '',
+      });
+    }
+    if (s.declinedAt) {
+      events.push({
+        _id:         `declined-${s._id}`,
+        action:      'declined',
+        label:       'Employee Declined',
+        actorName:   s.recipientName,
+        actorEmail:  s.recipientEmail,
+        timestamp:   s.declinedAt,
+      });
+    }
+    for (const entry of s.auditLog || []) {
+      events.push({
+        _id:        `audit-${s._id}-${entry.timestamp}`,
+        action:     entry.action === 'link_sent' ? 'sent'
+          : entry.action === 'link_opened' ? 'viewed'
+          : entry.action === 'signed' ? 'signed'
+          : entry.action === 'declined' ? 'declined'
+          : entry.action,
+        label:      entry.action.replace(/_/g, ' '),
+        actorName:  s.recipientName,
+        actorEmail: s.recipientEmail,
+        timestamp:  entry.timestamp,
+        ip:         entry.ipAddress || '',
+        ipAddress:  entry.ipAddress || '',
+        city:       entry.location?.city || '',
+        region:     entry.location?.region || '',
+        country:    entry.location?.country || '',
+        device:     entry.deviceInfo?.device || '',
+        browser:    entry.deviceInfo?.browser || '',
+        os:         entry.deviceInfo?.os || '',
+        localTime:  entry.localTime || '',
+        note:       entry.note || '',
+      });
+    }
+  }
+
+  for (const log of dbLogs) {
+    const actor = log.performed_by || {};
+    const loc   = log.location || {};
+    const dev   = log.device || {};
+    events.push({
+      _id:        String(log._id),
+      action:     (log.action || '').replace('_template', '').replace('employee_signed', 'signed').replace('boss_signed', 'boss_signed'),
+      label:      log.action?.replace(/_/g, ' ') || 'Event',
+      actorName:  actor.name || 'System',
+      actorEmail: actor.email || '',
+      timestamp:  log.timestamp || log.createdAt,
+      ip:         loc.ip || actor.ip || '',
+      ipAddress:  loc.ip || '',
+      city:       loc.city || '',
+      region:     loc.region || '',
+      country:    loc.country || '',
+      postalCode: loc.postalCode || '',
+      device:     dev.device_name || dev.device || '',
+      browser:    dev.browser || '',
+      os:         dev.os || '',
+      localTime:  log.local_time || '',
+      note:       log.note || '',
+    });
+  }
+
+  // De-dupe by _id and sort newest first
+  const seen = new Set();
+  const unique = events.filter(e => {
+    const key = e._id || `${e.action}-${e.timestamp}-${e.actorEmail}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  unique.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  return res.json({
+    success: true,
+    audit: { events: unique },
+  });
+});
+
+async function resolveSessionTemplateContext(session) {
+  const tmpl = session.template;
+  let templateObj = typeof tmpl?.toObject === 'function'
+    ? tmpl.toObject({ virtuals: true })
+    : { ...(tmpl || {}) };
+
+  if (session.campaignId) {
+    const campaign = await TemplateCampaign.findById(session.campaignId).lean();
+    if (campaign) {
+      templateObj = {
+        ...templateObj,
+        title:             campaign.title,
+        message:           campaign.message,
+        useCustomEmailBody: campaign.useCustomEmailBody,
+        customEmailBody:    campaign.customEmailBody,
+        customEmailSubject: campaign.customEmailSubject,
+        companyName:       campaign.companyName,
+        companyLogo:       campaign.companyLogo,
+        emailHeaderColor:  campaign.emailHeaderColor,
+        fields:            campaign.fields,
+        totalPages:        campaign.totalPages,
+        fileUrl:           campaign.fileUrl           || templateObj.fileUrl,
+        filePublicId:      campaign.filePublicId      || templateObj.filePublicId,
+        localPdfPath:      campaign.localPdfPath      || templateObj.localPdfPath,
+        localBossSignedPdfPath:
+          campaign.localBossSignedPdfPath || templateObj.localBossSignedPdfPath,
+        bossSignedFileUrl: campaign.bossSignedFileUrl || templateObj.bossSignedFileUrl,
+        bossSignature:     campaign.bossSignature,
+        ccList:            campaign.ccList,
+        signingConfig:     campaign.signingConfig,
+        _campaignId:       String(campaign._id),
+      };
+    }
+  }
+
+  return templateObj;
+}
+
+/** Boss-signed PDF source record for employee PDF generation */
+function buildBossPdfSource(template) {
+  return {
+    fileUrl:            template.bossSignedFileUrl || template.fileUrl,
+    filePublicId:       template.filePublicId,
+    localPdfPath:       template.localPdfPath,
+    localSignedPdfPath: template.localBossSignedPdfPath,
+    bossSignedFileUrl:  template.bossSignedFileUrl,
+  };
+}
+
+/** Build merged field list (boss + employee) with values for PDF embedding */
+function buildTemplateFieldsWithValues(template, session, { signatureDataUrl = null } = {}) {
+  const bossSigUrl = template.bossSignature?.signatureImageUrl || null;
+
+  return (template.fields || [])
+    .filter(f => f.assignedTo === 'boss' || f.assignedTo === 'employee')
+    .map(field => {
+      const plain = field.toObject ? field.toObject() : { ...field };
+
+      if (plain.assignedTo === 'boss') {
+        if (plain.type === 'signature' || plain.type === 'initial') {
+          return { ...plain, value: bossSigUrl || plain.value || null };
+        }
+        return { ...plain, value: plain.value || null };
+      }
+
+      // employee fields
+      if (plain.type === 'signature' || plain.type === 'initial') {
+        return {
+          ...plain,
+          value: signatureDataUrl || session.signatureImageUrl || plain.value || null,
+        };
+      }
+      const fv = (session.fieldValues || []).find(v => v.fieldId === plain.id);
+      return { ...plain, value: fv?.value || plain.value || null };
+    });
+}
+
+/** Build employee signed PDF bytes + audit sessionDoc */
+async function buildEmployeeSessionPdf(session, template, { signatureDataUrl = null } = {}) {
+  if (!pdfService?.generateEmployeePdf) {
+    throw new Error('PDF service unavailable.');
+  }
+
+  const fieldsWithValues = buildTemplateFieldsWithValues(template, session, { signatureDataUrl });
+
+  const ownerUser = template.owner
+    ? await User.findById(template.owner).select('full_name email designation').lean()
+    : null;
+
+  const geo        = session.signingMeta?.location || {};
+  const deviceInfo = session.signingMeta?.deviceInfo || {};
+  const ip         = session.signingMeta?.ipAddress || '';
+  const localTime  = session.signingMeta?.localTime || session.signedAt?.toUTCString?.() || '';
+
+  const employeeAudit = toSignerAuditFields(geo, ip, deviceInfo, localTime);
+
+  const sessionDoc = {
+    _id:         template._id,
+    title:       template.title,
+    companyName: template.companyName || '',
+    status:      'completed',
+    completedAt: session.signedAt || new Date(),
+    ccList:      template.ccList || [],
+    parties: [
+      {
+        name:            ownerUser?.full_name || 'Authoriser',
+        email:           ownerUser?.email || '',
+        designation:     ownerUser?.designation || 'Authoriser',
+        role:            'Authoriser',
+        status:          'signed',
+        signedAt:        template.bossSignature?.signedAt,
+        ipAddress:       template.bossSignature?.ipAddress || '',
+        city:            template.bossSignature?.city      || '',
+        region:          template.bossSignature?.region    || '',
+        country:         template.bossSignature?.country   || '',
+        postalCode:      template.bossSignature?.postalCode || '',
+        timezone:        template.bossSignature?.timezone  || '',
+        latitude:        template.bossSignature?.latitude  || '',
+        longitude:       template.bossSignature?.longitude || '',
+        device:          template.bossSignature?.device    || '',
+        browser:         template.bossSignature?.browser   || '',
+        os:              template.bossSignature?.os        || '',
+        localSignedTime: template.bossSignature?.signedAt
+          ? new Date(template.bossSignature.signedAt).toUTCString()
+          : '',
+      },
+      {
+        name:            session.recipientName,
+        email:           session.recipientEmail,
+        designation:     session.recipientDesignation || 'Employee',
+        role:            'Employee',
+        status:          'signed',
+        signedAt:        session.signedAt || new Date(),
+        localSignedTime: session.signingMeta?.localTime
+          || (session.signedAt ? new Date(session.signedAt).toUTCString() : ''),
+        geoSource:       geo.source || 'unknown',
+        ...employeeAudit,
+      },
+    ],
+  };
+
+  const pdfBytes = await Promise.race([
+    pdfService.generateEmployeePdf(
+      buildBossPdfSource(template),
+      fieldsWithValues,
+      sessionDoc,
+    ),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('generateEmployeePdf timeout')), 45_000),
+    ),
+  ]);
+
+  return {
+    pdfBuffer:  Buffer.from(pdfBytes),
+    sessionDoc,
+  };
+}
+
+/** Save employee signed PDF locally (+ Cloudinary when possible) */
+async function persistEmployeeSessionPdf(session, pdfBuffer) {
+  session.localSignedPdfPath = savePdfBuffer(pdfBuffer, `employee_${session._id}`);
+
+  try {
+    const pdfResult = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        {
+          resource_type: 'raw',
+          folder:        'nexsign/employee-signed',
+          public_id:     `employee_${session._id}_${Date.now()}`,
+          format:        'pdf',
+        },
+        (err, result) => err ? reject(err) : resolve(result),
+      );
+      stream.end(pdfBuffer);
+    });
+    session.signedFileUrl      = pdfResult.secure_url;
+    session.signedFilePublicId = pdfResult.public_id;
+  } catch (e) {
+    console.error('[persistEmployeeSessionPdf] Cloudinary upload failed:', e.message);
+  }
+
+  await session.save();
+  return session;
+}
+
+/** Ensure signed session has a stored PDF; (re)generate to include all signatures */
+async function ensureEmployeeSessionPdf(session, template) {
+  const { pdfBuffer } = await buildEmployeeSessionPdf(session, template);
+  return persistEmployeeSessionPdf(session, pdfBuffer);
+}
+
+// ════════════════════════════════════════════════════
 // 8. VALIDATE SESSION TOKEN (public)
 // GET /api/templates/sign/validate/:token
 // ════════════════════════════════════════════════════
@@ -712,10 +1364,7 @@ const getSessionByToken = asyncHandler(async (req, res) => {
   });
 
   // Return safe data
-  const tmpl = session.template;
-  const templateObj = typeof tmpl.toObject === 'function'
-    ? tmpl.toObject({ virtuals: true })
-    : { ...tmpl };
+  const templateObj = await resolveSessionTemplateContext(session);
 
   return res.json({
     success: true,
@@ -756,7 +1405,7 @@ const getSessionByToken = asyncHandler(async (req, res) => {
 const employeeSign = asyncHandler(async (req, res) => {
   const {
     signatureDataUrl, fieldValues,
-    latitude, longitude, clientTime,
+    latitude, longitude, clientTime, auditMeta,
   } = req.body;
 
   const session = await TemplateSession.findByToken(req.params.token);
@@ -789,19 +1438,16 @@ const employeeSign = asyncHandler(async (req, res) => {
 
   const ip         = getIP(req);
   const ua         = req.headers['user-agent'] || '';
-  const geo        = await getGeoInfo(ip);
   const deviceInfo = parseDevice(ua);
   const localTime  = clientTime || new Date().toUTCString();
+  const geo        = await resolveSigningLocation(ip, latitude, longitude);
+  if (auditMeta?.timezone && !geo.timezone) geo.timezone = auditMeta.timezone;
 
-  // ── Load template ──────────────────────────────────
-  const template = await Template.findById(
-    session.template._id || session.template
-  );
-  if (!template)
-    return res.status(404).json({
-      success: false,
-      message: 'Template not found.',
-    });
+  // ── Load template (campaign overlay for reuse batches) ──
+  const template = await resolveSessionTemplateContext(session);
+  if (!template?._id) {
+    return res.status(404).json({ success: false, message: 'Template not found.' });
+  }
 
   // ── Employee fields filter ─────────────────────────
   const employeeFields = (template.fields || [])
@@ -885,124 +1531,19 @@ const employeeSign = asyncHandler(async (req, res) => {
         },
       });
 
-      // ── Step 3: Build fields with values for PDF ───
-      // employee fields + values merge করো
-      const fieldsWithValues = employeeFields.map(field => {
-        // signature/initial field
-        if (field.type === 'signature' || field.type === 'initial') {
-          return {
-            ...field.toObject ? field.toObject() : field,
-            // ✅ FIX: Cloudinary URL না, original base64 use করো
-            value: signatureDataUrl || null,
-          };
-        }
-        // other fields — fieldValues array থেকে value নাও
-        const fv = parsedFieldValues.find(v => v.fieldId === field.id);
-        return {
-          ...field.toObject ? field.toObject() : field,
-          value: fv?.value || field.value || null,
-        };
-      });
-
-      // ── Step 4: Build sessionDoc for audit page ─────
-      // ✅ FIX: parties array তৈরি করো
-      const sessionDoc = {
-        _id:         template._id,
-        title:       template.title,
-        companyName: template.companyName || '',
-        status:      'completed',
-        completedAt: new Date(),
-        ccList:      template.ccList || [],
-        parties: [
-          // Boss party
-          {
-            name:            template.owner
-                               ? (await User.findById(template.owner)
-                                    .select('full_name email designation')
-                                    .lean()
-                                 )?.full_name || 'Authoriser'
-                               : 'Authoriser',
-            email:           template.bossSignature?.signatureImageUrl
-                               ? template.bossSignature.signatureImageUrl
-                               : '',
-            designation:     '',
-            status:          'signed',
-            signedAt:        template.bossSignature?.signedAt,
-            ipAddress:       template.bossSignature?.ipAddress || '',
-            city:            template.bossSignature?.city      || '',
-            country:         template.bossSignature?.country   || '',
-            device:          template.bossSignature?.device    || '',
-            browser:         template.bossSignature?.browser   || '',
-            os:              template.bossSignature?.os        || '',
-            localSignedTime: template.bossSignature?.signedAt
-                               ? new Date(template.bossSignature.signedAt).toUTCString()
-                               : '',
-          },
-          // Employee party
-          {
-            name:            session.recipientName,
-            email:           session.recipientEmail,
-            designation:     session.recipientDesignation || '',
-            status:          'signed',
-            signedAt:        session.signedAt || new Date(),
-            ipAddress:       ip,
-            city:            geo?.city    || '',
-            country:         geo?.country || '',
-            device:          deviceInfo?.device  || '',
-            browser:         deviceInfo?.browser || '',
-            os:              deviceInfo?.os      || '',
-            localSignedTime: localTime,
-          },
-        ],
-      };
-
-      // ── Step 5: Generate PDF ────────────────────────
-      // ✅ FIX: generateEmployeePdf(source, fields, sessionDoc)
-      // — 3 separate arguments, NOT an object
+      // ── Step 3–5: Generate & store signed PDF ───────
       let signedFileUrl = null;
       let pdfBuffer     = null;
+      let sessionDoc    = null;
 
-      if (pdfService?.generateEmployeePdf) {
-        try {
-          // ✅ FIX: correct arguments order
-          const pdfBytes = await Promise.race([
-            pdfService.generateEmployeePdf(
-              template.bossSignedFileUrl || template.fileUrl,  // arg1: source URL
-              fieldsWithValues,                                 // arg2: fields array
-              sessionDoc,                                       // arg3: audit data
-            ),
-            new Promise((_, reject) =>
-              setTimeout(
-                () => reject(new Error('generateEmployeePdf timeout')),
-                25_000,
-              )
-            ),
-          ]);
-
-          pdfBuffer = Buffer.from(pdfBytes);
-
-          // Upload to Cloudinary
-          const pdfResult = await new Promise((resolve, reject) => {
-            const stream = cloudinary.uploader.upload_stream(
-              {
-                resource_type: 'raw',
-                folder:        'nexsign/employee-signed',
-                public_id:     `employee_${session._id}_${Date.now()}`,
-                format:        'pdf',
-              },
-              (err, result) => err ? reject(err) : resolve(result),
-            );
-            stream.end(pdfBuffer);
-          });
-
-          signedFileUrl              = pdfResult.secure_url;
-          session.signedFileUrl      = signedFileUrl;
-          session.signedFilePublicId = pdfResult.public_id;
-          await session.save();
-
-        } catch (e) {
-          console.error('[employeeSign] PDF generation failed:', e.message);
-        }
+      try {
+        const built = await buildEmployeeSessionPdf(session, template, { signatureDataUrl });
+        pdfBuffer  = built.pdfBuffer;
+        sessionDoc = built.sessionDoc;
+        await persistEmployeeSessionPdf(session, pdfBuffer);
+        signedFileUrl = session.signedFileUrl;
+      } catch (e) {
+        console.error('[employeeSign] PDF generation failed:', e.message);
       }
 
       // ── Step 6: Update template stats ──────────────
@@ -1010,17 +1551,19 @@ const employeeSign = asyncHandler(async (req, res) => {
 
       // ── Step 7: Completion email to employee ───────
       try {
-        await sendCompletionEmail?.({
-          recipientEmail:       session.recipientEmail,
-          recipientName:        session.recipientName,
-          recipientDesignation: session.recipientDesignation || '',
-          documentTitle:        template.title,
-          pdfBuffer:            pdfBuffer || null,
-          signedPdfUrl:         signedFileUrl || template.bossSignedFileUrl || '',
-          companyName:          template.companyName || '',
-          companyLogoUrl:       template.companyLogo || '',
-          parties:              sessionDoc.parties,
-        });
+        if (sessionDoc) {
+          await sendCompletionEmail?.({
+            recipientEmail:       session.recipientEmail,
+            recipientName:        session.recipientName,
+            recipientDesignation: session.recipientDesignation || '',
+            documentTitle:        template.title,
+            pdfBuffer:            pdfBuffer || null,
+            signedPdfUrl:         signedFileUrl || template.bossSignedFileUrl || '',
+            companyName:          template.companyName || '',
+            companyLogoUrl:       template.companyLogo || '',
+            parties:              sessionDoc.parties,
+          });
+        }
       } catch (e) {
         console.error('[employeeSign] Completion email failed:', e.message);
       }
@@ -1036,11 +1579,11 @@ const employeeSign = asyncHandler(async (req, res) => {
             recipientEmail:  owner?.email,
             recipientName:   owner?.full_name || 'Owner',
             documentTitle:   template.title,
-            pdfBuffer:       null,
+            pdfBuffer:       pdfBuffer || null,
             signedPdfUrl:    signedFileUrl || '',
             companyName:     template.companyName || '',
             companyLogoUrl:  template.companyLogo || '',
-            parties:         sessionDoc.parties,
+            parties:         sessionDoc?.parties || [],
           });
 
           // ✅ FIX: CC emails with PDF attachment
@@ -1069,6 +1612,8 @@ const employeeSign = asyncHandler(async (req, res) => {
       safeAuditLog({
         action:         'employee_signed_template',
         document_id:    template._id,
+        template_id:    template._id,
+        session_id:     session._id,
         document_title: template.title,
         performed_by: {
           name:  session.recipientName,
@@ -1077,16 +1622,12 @@ const employeeSign = asyncHandler(async (req, res) => {
         },
         device: {
           device_name: deviceInfo.device,
+          device_type: deviceInfo.deviceType || (deviceInfo.isMobile ? 'mobile' : 'desktop'),
           browser:     deviceInfo.browser,
           os:          deviceInfo.os,
         },
-        location: {
-          ip_address: ip,
-          city:       geo?.city,
-          country:    geo?.country,
-          display:    geo?.display,
-        },
-        local_time: localTime,
+        location:     toAuditLocation(geo, ip),
+        local_time:   localTime,
       });
 
       // ── Step 10: Socket emit ────────────────────────
@@ -1173,6 +1714,120 @@ const employeeDecline = asyncHandler(async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════
+// 11a. GET EMPLOYEE SIGNED PDF (owner)
+// GET /api/templates/:id/sessions/:sessionId/pdf
+// ════════════════════════════════════════════════════
+const getSessionSignedPdf = asyncHandler(async (req, res) => {
+  try {
+    const template = await Template.findOne({
+      _id:       req.params.id,
+      owner:     req.user._id,
+      isDeleted: false,
+    }).lean();
+
+    if (!template)
+      return res.status(404).json({ success: false, message: 'Template not found.' });
+
+    let session = await TemplateSession.findOne({
+      _id:       req.params.sessionId,
+      template:  template._id,
+      isDeleted: { $ne: true },
+    });
+
+    if (!session)
+      return res.status(404).json({ success: false, message: 'Session not found.' });
+
+    if (session.status !== 'signed')
+      return res.status(400).json({ success: false, message: 'Employee has not signed yet.' });
+
+    const templateCtx = await resolveSessionTemplateContext({
+      template,
+      campaignId: session.campaignId,
+    });
+
+    session = await ensureEmployeeSessionPdf(session, templateCtx);
+
+    const buffer = await getPdfBytes({
+      fileUrl:      session.signedFileUrl,
+      filePublicId: session.signedFilePublicId,
+      localPdfPath: session.localSignedPdfPath,
+    });
+
+    const safeName = `${template.title}_${session.recipientName}`
+      .replace(/[^a-zA-Z0-9._-]/g, '_');
+    return sendPdf(res, buffer, safeName);
+  } catch (err) {
+    console.error('[getSessionSignedPdf]', err.message);
+    return res.status(502).json({ success: false, message: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════
+// 11b. RESEND SIGNED COPY TO EMPLOYEE
+// POST /api/templates/:id/sessions/:sessionId/resend-signed
+// ════════════════════════════════════════════════════
+const resendSignedCopy = asyncHandler(async (req, res) => {
+  const template = await Template.findOne({
+    _id:       req.params.id,
+    owner:     req.user._id,
+    isDeleted: false,
+  }).lean();
+
+  if (!template)
+    return res.status(404).json({ success: false, message: 'Template not found.' });
+
+  let session = await TemplateSession.findOne({
+    _id:       req.params.sessionId,
+    template:  template._id,
+    isDeleted: { $ne: true },
+  });
+
+  if (!session)
+    return res.status(404).json({ success: false, message: 'Session not found.' });
+
+  if (session.status !== 'signed')
+    return res.status(400).json({ success: false, message: 'Employee has not signed yet.' });
+
+  const templateCtx = await resolveSessionTemplateContext({
+    template,
+    campaignId: session.campaignId,
+  });
+
+  try {
+    session = await ensureEmployeeSessionPdf(session, templateCtx);
+    const { sessionDoc } = await buildEmployeeSessionPdf(session, templateCtx);
+    const pdfBuffer = await getPdfBytes({
+      fileUrl:      session.signedFileUrl,
+      filePublicId: session.signedFilePublicId,
+      localPdfPath: session.localSignedPdfPath,
+    });
+
+    await sendCompletionEmail?.({
+      recipientEmail:       session.recipientEmail,
+      recipientName:        session.recipientName,
+      recipientDesignation: session.recipientDesignation || '',
+      documentTitle:        template.title,
+      pdfBuffer,
+      signedPdfUrl:         session.signedFileUrl || '',
+      companyName:          template.companyName || '',
+      companyLogoUrl:       template.companyLogo || '',
+      parties:              sessionDoc.parties,
+    });
+
+    return res.json({
+      success: true,
+      message: `Signed copy sent to ${session.recipientEmail}.`,
+    });
+  } catch (err) {
+    console.error('[resendSignedCopy]', err.message);
+    return res.status(502).json({
+      success: false,
+      message: `Could not send signed copy: ${err.message}`,
+    });
+  }
+});
+
+// ════════════════════════════════════════════════════
 // 11. RESEND EMAIL
 // POST /api/templates/:id/sessions/:sessionId/resend
 // ════════════════════════════════════════════════════
@@ -1211,24 +1866,28 @@ const resendEmail = asyncHandler(async (req, res) => {
   }
 
   await session.addReminder({ note: `Reminder by ${req.user.email}` });
-  await session.save();
 
-await sendEmployeeSigningEmail?.({
-    // ✅ FIXED
-    employeeEmail:   session.recipientEmail,
-    employeeName:    session.recipientName,
-    documentTitle:   template.title,
-    signingLink:     `${FRONT()}/template-sign/${session.token}`,
-    bossName:        req.user.full_name || req.user.name || 'Your Manager',
-    bossDesignation: req.user.designation || '',
-    companyName:     template.companyName || '',
-    companyLogoUrl:  template.companyLogo || '',
+  const result = await dispatchEmployeeEmail({
+    session,
+    template,
+    bossUser: req.user,
   });
+  await recordSessionEmailResult(session, result);
+
+  if (!result?.success) {
+    return res.status(502).json({
+      success: false,
+      message: `Could not deliver email to ${session.recipientEmail}. ${result?.error || ''}`.trim(),
+      emailDelivered: false,
+      emailError:     result?.error || 'Delivery failed',
+    });
+  }
 
   return res.json({
     success: true,
-    message: `Reminder sent to ${session.recipientEmail}.`,
-    reminderCount: session.reminderCount,
+    message: `Email sent to ${session.recipientEmail}.`,
+    reminderCount:  session.reminderCount,
+    emailDelivered: true,
   });
 });
 
@@ -1241,31 +1900,170 @@ const getTemplatePdf = asyncHandler(async (req, res) => {
     const session = await TemplateSession.findOne({
       token:     req.params.token,
       isDeleted: { $ne: true },
-    }).populate('template', 'fileUrl bossSignedFileUrl title');
+    }).populate('template', 'fileUrl filePublicId bossSignedFileUrl title localPdfPath localBossSignedPdfPath');
 
     if (!session)
       return res.status(404).send('Not found');
 
-    const tmpl  = session.template;
-    const url   = tmpl.bossSignedFileUrl || tmpl.fileUrl;
+    session.template = session.template || { _id: session.templateId };
+    const tmpl = await resolveSessionTemplateContext(session);
+    if (!tmpl) return res.status(404).send('PDF not available');
 
-    if (!url) return res.status(404).send('PDF not available');
+    const record = {
+      fileUrl:            tmpl.bossSignedFileUrl || tmpl.fileUrl,
+      filePublicId:       tmpl.filePublicId,
+      localPdfPath:       tmpl.localPdfPath,
+      localSignedPdfPath: tmpl.localBossSignedPdfPath,
+      bossSignedFileUrl:  tmpl.bossSignedFileUrl,
+    };
 
-    const response = await fetch(url);
-    if (!response.ok) return res.status(502).send('PDF fetch failed');
-
-    const buffer = await response.arrayBuffer();
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition',
-      `inline; filename="${tmpl.title || 'document'}.pdf"`);
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.send(Buffer.from(buffer));
-
+    let buffer;
+    try {
+      buffer = await getPdfBytes(record, { preferSigned: !!tmpl.bossSignedFileUrl });
+    } catch (fetchErr) {
+      const cacheId = tmpl._campaignId || tmpl._id;
+      if (cacheId && tmpl.fileUrl) {
+        try {
+          const bytes = await getPdfBytes({
+            fileUrl:      tmpl.fileUrl,
+            filePublicId: tmpl.filePublicId,
+          });
+          const filename = savePdfBuffer(bytes, String(cacheId));
+          if (tmpl._campaignId) {
+            await TemplateCampaign.updateOne(
+              { _id: tmpl._campaignId },
+              { localPdfPath: filename },
+            );
+          } else if (tmpl._id) {
+            await Template.updateOne({ _id: tmpl._id }, { localPdfPath: filename });
+          }
+          buffer = bytes;
+        } catch {
+          throw fetchErr;
+        }
+      } else {
+        throw fetchErr;
+      }
+    }
+    return sendPdf(res, buffer, tmpl.title, { publicAccess: true });
   } catch (err) {
     console.error('[getTemplatePdf]', err.message);
-    return res.status(500).send(err.message);
+    return res.status(502).send(err.message);
   }
+});
+
+// ════════════════════════════════════════════════════
+// 13. EMAIL PREVIEW (owner — before/after send)
+// POST /api/templates/email-preview
+// POST /api/templates/:id/email-preview
+// ════════════════════════════════════════════════════
+const previewEmployeeEmail = asyncHandler(async (req, res) => {
+  const bossUser = req.user;
+  let template = null;
+
+  if (req.params.id) {
+    template = await Template.findOne({
+      _id: req.params.id, owner: req.user._id, isDeleted: false,
+    }).lean();
+    if (!template) {
+      return res.status(404).json({ success: false, message: 'Template not found.' });
+    }
+  }
+
+  const body = req.body || {};
+  const employee = body.employee || {};
+  const expiryDays = template?.signingConfig?.expiryDays || body.expiryDays || 30;
+  const expiryDate = new Date(Date.now() + expiryDays * 86_400_000)
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+
+  const sc = template?.signingConfig || {};
+  const useCustom = body.useCustomEmailBody ?? template?.useCustomEmailBody ?? sc.useCustomEmailBody ?? false;
+  const customBody = body.customEmailBody ?? template?.customEmailBody ?? sc.customEmailBody ?? '';
+  const customSubject = body.customEmailSubject ?? template?.customEmailSubject ?? sc.customEmailSubject ?? '';
+
+  const preview = buildEmailPreview?.('employee_signing_request', {
+    to:                  employee.email || 'employee@company.com',
+    employeeName:        employee.name || 'Employee Name',
+    employeeDesignation: employee.designation || '',
+    docTitle:            body.documentTitle || template?.title || 'Document Title',
+    actionUrl:           `${FRONT()}/template-sign/preview-token`,
+    bossName:            body.bossName || bossUser.full_name || 'Manager Name',
+    bossDesignation:     body.bossDesignation || bossUser.designation || '',
+    companyName:         body.companyName || template?.companyName || 'Company Name',
+    companyLogo:         body.companyLogo || template?.companyLogo || bossUser.company_logo || '',
+    emailHeaderColor:    body.emailHeaderColor || template?.emailHeaderColor || '#0f172a',
+    customMessage:       body.message || template?.message || sc.emailMessage || '',
+    expiryDate,
+    useCustomEmailBody:  useCustom,
+    customEmailBody:     customBody,
+    customEmailSubject:  customSubject,
+  });
+
+  if (!preview) {
+    return res.status(503).json({ success: false, message: 'Email preview unavailable.' });
+  }
+
+  return res.json({ success: true, ...preview });
+});
+
+// ════════════════════════════════════════════════════
+// 14. RESEND ALL FAILED EMPLOYEE EMAILS
+// POST /api/templates/:id/resend-failed
+// ════════════════════════════════════════════════════
+const resendFailedEmails = asyncHandler(async (req, res) => {
+  const template = await Template.findOne({
+    _id: req.params.id, owner: req.user._id, isDeleted: false,
+  });
+
+  if (!template) {
+    return res.status(404).json({ success: false, message: 'Template not found.' });
+  }
+
+  const sessions = await TemplateSession.find({
+    template:       template._id,
+    emailDelivered: { $ne: true },
+    status:         { $in: ['pending', 'viewed', 'expired'] },
+    isDeleted:      { $ne: true },
+  });
+
+  if (!sessions.length) {
+    return res.json({ success: true, message: 'No failed emails to resend.', resent: 0 });
+  }
+
+  const failed = [];
+  let resent = 0;
+
+  for (const session of sessions) {
+    if (session.status === 'expired' || !session.token) {
+      session.token     = generateToken();
+      session.status    = 'pending';
+      session.expiresAt = new Date(Date.now() + 7 * 86_400_000);
+    }
+
+    const result = await dispatchEmployeeEmail({ session, template, bossUser: req.user });
+    await recordSessionEmailResult(session, result);
+
+    if (result?.success) resent += 1;
+    else failed.push({ name: session.recipientName, email: session.recipientEmail, error: result?.error });
+  }
+
+  if (failed.length) {
+    await sendEmailDeliveryFailureNotice?.({
+      ownerEmail: req.user.email,
+      ownerName:  req.user.full_name || req.user.name,
+      docTitle:   template.title,
+      failed,
+      totalCount: sessions.length,
+    });
+  }
+
+  return res.json({
+    success: true,
+    message: `Resent ${resent}/${sessions.length} failed emails.`,
+    resent,
+    stillFailed: failed.length,
+    failedRecipients: failed,
+  });
 });
 
 // ════════════════════════════════════════════════════
@@ -1279,9 +2077,16 @@ module.exports = {
   deleteTemplate,
   bossSign,
   getTemplateSessions,
+  getTemplateAudit,
   getSessionByToken,
+  getSessionSignedPdf,
+  resendSignedCopy,
   employeeSign,
   employeeDecline,
   resendEmail,
+  resendFailedEmails,
+  previewEmployeeEmail,
   getTemplatePdf,
+  distributeTemplateEmployees,
+  emailTemplateApprover,
 };

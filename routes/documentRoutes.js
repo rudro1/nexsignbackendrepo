@@ -16,12 +16,15 @@ const {
   sendSigningEmail,
   sendCompletionEmail,
   sendCCEmail,
+  buildEmailPreview,
 } = require('../utils/emailService');
 
 const {
   mergeSignaturesIntoPDF,
   appendAuditPage,
 } = require('../utils/pdfService');
+
+const { savePdfBuffer, getPdfBytes, sendPdf } = require('../utils/pdfStorage');
 
 // NOTE: Cloudinary is configured globally in index.js.
 // Calling cloudinary.config() here again is redundant and was removed (Phase 1 fix).
@@ -151,14 +154,15 @@ function parseDevice(ua = '') {
 async function getGeoLocation(ip) {
   try {
     // Local / private IP → dummy data
+    const normalizedIp = String(ip || '').replace(/^::ffff:/, '');
     if (
       !ip ||
       ip === 'Unknown' ||
-      ip.startsWith('127.') ||
+      normalizedIp.startsWith('127.') ||
       ip.startsWith('::1') ||
       ip.startsWith('::') ||
-      ip.startsWith('10.') ||
-      ip.startsWith('192.168.') ||
+      normalizedIp.startsWith('10.') ||
+      normalizedIp.startsWith('192.168.') ||
       ip === 'localhost'
     ) {
       return {
@@ -474,6 +478,8 @@ router.post(
         fileSize: req.file.size,
         status:   'draft',
       });
+      doc.localPdfPath = savePdfBuffer(req.file.buffer, String(doc._id));
+      await doc.save();
       return res.status(201).json({ success: true, document: doc });
     } catch (err) {
       console.error('[POST /upload]', err.message);
@@ -514,6 +520,35 @@ router.post(
   },
 );
 
+// ── 3b. EMAIL PREVIEW (sequential documents) ────────────────────
+router.post('/email-preview', auth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const preview = buildEmailPreview('signing_request', {
+      to:                  body.recipientEmail || 'signer@example.com',
+      signerName:          body.signerName || body.recipientName || 'Signer Name',
+      senderName:          body.senderName || req.user.full_name || 'Sender Name',
+      senderDesignation:   body.senderDesignation || req.user.designation || '',
+      senderEmail:         body.senderEmail || req.user.email,
+      docTitle:            body.documentTitle || body.title || 'Document Title',
+      actionUrl:           `${FRONT()}/sign/preview-token`,
+      companyLogo:         body.companyLogo || req.user.company_logo || '',
+      companyName:         body.companyName || req.user.company_name || 'Company Name',
+      emailHeaderColor:    body.emailHeaderColor || '#0f172a',
+      customMessage:       body.message || '',
+      partyNumber:         body.partyNumber || 1,
+      totalParties:        body.totalParties || 1,
+      useCustomEmailBody:  body.useCustomEmailBody,
+      customEmailBody:     body.customEmailBody || '',
+      customEmailSubject:  body.customEmailSubject || '',
+    });
+    return res.json({ success: true, ...preview });
+  } catch (err) {
+    console.error('[POST /documents/email-preview]', err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ── 4. SEND FOR SIGNING ─────────────────────────────────────────
 router.post(
   '/upload-and-send',
@@ -529,7 +564,8 @@ router.post(
       const {
         title, parties: partiesRaw, fields: fieldsRaw,
         ccList: ccRaw, totalPages, companyName,
-        companyLogo, message, docId,
+        companyLogo, message, docId, emailHeaderColor,
+        useCustomEmailBody, customEmailBody, customEmailSubject,
       } = req.body;
 
       let parsedParties, parsedFields, parsedCC;
@@ -574,6 +610,7 @@ router.post(
           fileName: req.file.originalname,
           fileSize: req.file.size,
         });
+        doc.localPdfPath = savePdfBuffer(req.file.buffer, 'draft');
       }
 
       if (!doc) {
@@ -582,12 +619,28 @@ router.post(
         });
       }
 
+      // Ensure local PDF copy exists (Cloudinary raw URLs return 401 when PDF delivery is restricted)
+      if (req.file?.buffer) {
+        doc.localPdfPath = savePdfBuffer(req.file.buffer, String(doc._id || 'send'));
+      } else if (!doc.localPdfPath && doc.fileUrl) {
+        try {
+          const bytes = await getPdfBytes(doc);
+          doc.localPdfPath = savePdfBuffer(bytes, String(doc._id));
+        } catch (localErr) {
+          console.warn('[upload-and-send] Could not cache local PDF:', localErr.message);
+        }
+      }
+
       const firstToken = crypto.randomBytes(32).toString('hex');
 
       doc.title             = title?.trim() || doc.title || 'Untitled';
       doc.companyName       = companyName || '';
-      doc.companyLogo       = companyLogo || '';
+      doc.companyLogo       = companyLogo || req.user.company_logo || '';
+      doc.emailHeaderColor  = emailHeaderColor || doc.emailHeaderColor || '#0f172a';
       doc.message           = message     || '';
+      doc.useCustomEmailBody = useCustomEmailBody === true || useCustomEmailBody === 'true';
+      doc.customEmailBody    = customEmailBody    || '';
+      doc.customEmailSubject = customEmailSubject || '';
       doc.totalPages        = Number(totalPages) || 1;
       doc.fields            = parsedFields.map(f => ({
         id:              f.id,
@@ -650,28 +703,42 @@ router.post(
       });
 
       const first = doc.parties[0];
-      try {
-        await sendSigningEmail({
-          recipientEmail:       first.email,
-          recipientName:        first.name,
-          recipientDesignation: first.designation,
-          senderName:           req.user.full_name,
-          senderDesignation:    req.user.designation,
-          documentTitle:        doc.title,
-          signingLink:          `${FRONT()}/sign/${firstToken}`,
-          companyLogoUrl:       doc.companyLogo,
-          companyName:          doc.companyName,
-          partyNumber:          1,
-          totalParties:         parsedParties.length,
-          message:              doc.message,
-          ccList:               parsedCC,
-        });
-      } catch (emailErr) {
-        console.error('[upload-and-send] First email failed:', emailErr.message);
-      }
+      const signingPayload = {
+        recipientEmail:       first.email,
+        recipientName:        first.name,
+        recipientDesignation: first.designation,
+        senderName:           req.user.full_name,
+        senderDesignation:    req.user.designation,
+        senderEmail:          req.user.email,
+        documentTitle:        doc.title,
+        signingLink:          `${FRONT()}/sign/${firstToken}`,
+        companyLogoUrl:       doc.companyLogo,
+        companyName:          doc.companyName,
+        emailHeaderColor:     doc.emailHeaderColor,
+        partyNumber:          1,
+        totalParties:         parsedParties.length,
+        message:              doc.message,
+        ccList:               parsedCC,
+        useCustomEmailBody:   doc.useCustomEmailBody,
+        customEmailBody:      doc.customEmailBody,
+        customEmailSubject:   doc.customEmailSubject,
+      };
 
-      // Send CC emails without blocking the response
-      parsedCC.map(cc =>
+      // Respond immediately — emails run in background
+      emitSocket(req, 'document:created', {
+        documentId: doc._id,
+        ownerId:    req.user.id,
+        title:      doc.title,
+        status:     doc.status,
+      });
+
+      res.json({ success: true, document: sanitizeDoc(doc) });
+
+      sendSigningEmail(signingPayload).catch(emailErr => {
+        console.error('[upload-and-send] First email failed:', emailErr.message);
+      });
+
+      parsedCC.forEach(cc =>
         sendCCEmail({
           recipientEmail:       cc.email,
           recipientName:        cc.name,
@@ -681,18 +748,12 @@ router.post(
           senderDesignation:    req.user.designation,
           companyLogoUrl:       doc.companyLogo,
           companyName:          doc.companyName,
+          emailHeaderColor:     doc.emailHeaderColor,
           parties:              parsedParties,
-        }).catch(e => console.error('[upload-and-send] CC email failed:', e.message))
+        }).catch(e => console.error('[upload-and-send] CC email failed:', e.message)),
       );
 
-      emitSocket(req, 'document:created', {
-        documentId: doc._id,
-        ownerId:    req.user.id,
-        title:      doc.title,
-        status:     doc.status,
-      });
-
-      return res.json({ success: true, document: sanitizeDoc(doc) });
+      return;
 
     } catch (err) {
       console.error('[POST /upload-and-send]', err.message);
@@ -755,21 +816,43 @@ router.get('/sign/validate/:token', async (req, res) => {
     if (device.browser) party.browser = device.browser;
     if (device.os)      party.os      = device.os;
 
-    // ✅ FIX: geo নিয়ে save করা হচ্ছে
-    // validate তে geo নেওয়া হচ্ছে — submit এ overwrite হবে
-    const geo = await getGeoLocation(ip);
-    if (geo) {
-      party.city        = geo.city        || null;
-      party.region      = geo.region      || null;
-      party.country     = geo.country     || null;
-      party.postalCode  = geo.postalCode  || null;
-      party.timezone    = geo.timezone    || null;
-      party.latitude    = geo.latitude    || null;
-      party.longitude   = geo.longitude   || null;
+    try {
+      await doc.save();
+    } catch (saveErr) {
+      console.error('[GET /sign/validate/:token] save failed:', saveErr.message);
     }
 
-    // ✅ FIX: await doc.save() — আগে এটা missing ছিল
-    await doc.save();
+    const safeDocument = sanitizeDoc(doc, idx);
+    const partyPayload = { ...party.toObject(), index: idx };
+
+    res.json({
+      success:  true,
+      document: safeDocument,
+      party:    partyPayload,
+      geo:      {},
+    });
+
+    // Geo enrichment + audit run after response so the signer page loads immediately
+    getGeoLocation(ip).then(async (geo) => {
+      if (!geo) return;
+      try {
+        const fresh = await Document.findOne({ 'parties.token': token });
+        if (!fresh) return;
+        const pIdx = fresh.parties.findIndex(p => p.token === token);
+        const p = fresh.parties[pIdx];
+        if (!p) return;
+        p.city       = geo.city       || null;
+        p.region     = geo.region     || null;
+        p.country    = geo.country    || null;
+        p.postalCode = geo.postalCode || null;
+        p.timezone   = geo.timezone   || null;
+        p.latitude   = geo.latitude   || null;
+        p.longitude  = geo.longitude  || null;
+        await fresh.save();
+      } catch (geoErr) {
+        console.warn('[GET /sign/validate/:token] geo save failed:', geoErr.message);
+      }
+    }).catch(() => {});
 
     safeAuditLog({
       document_id:    doc._id,
@@ -801,14 +884,7 @@ router.get('/sign/validate/:token', async (req, res) => {
       device:     device.device,
     });
 
-    const safeDocument = sanitizeDoc(doc, idx);
-
-    return res.json({
-      success:  true,
-      document: safeDocument,
-      party:    { ...party.toObject(), index: idx },
-      geo:      {},
-    });
+    return;
 
   } catch (err) {
     console.error('[GET /sign/validate/:token]', err.message);
@@ -821,26 +897,16 @@ router.get('/sign/:token/pdf', async (req, res) => {
   try {
     const doc = await Document
       .findOne({ 'parties.token': req.params.token })
-      .select('fileUrl title')
+      .select('fileUrl title localPdfPath signedFileUrl localSignedPdfPath')
       .lean();
 
     if (!doc) return res.status(404).send('Not found');
 
-    const response = await fetch(doc.fileUrl);
-    if (!response.ok) return res.status(502).send('PDF fetch failed');
-
-    const buffer = await response.arrayBuffer();
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${doc.title || 'document'}.pdf"`,
-    );
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.send(Buffer.from(buffer));
+    const buffer = await getPdfBytes(doc);
+    return sendPdf(res, buffer, doc.title, { publicAccess: true });
   } catch (err) {
     console.error('[GET /sign/:token/pdf]', err.message);
-    return res.status(500).send(err.message);
+    return res.status(err.message.includes('not available') ? 404 : 502).send(err.message);
   }
 });
 
@@ -998,10 +1064,14 @@ router.post('/sign/submit', async (req, res) => {
           signingLink:          `${FRONT()}/sign/${nextToken}`,
           companyLogoUrl:       doc.companyLogo,
           companyName:          doc.companyName,
+          emailHeaderColor:     doc.emailHeaderColor,
           partyNumber:          nextIdx + 1,
           totalParties:         doc.parties.length,
           message:              doc.message,
           ccList:               doc.ccList,
+          useCustomEmailBody:   doc.useCustomEmailBody,
+          customEmailBody:      doc.customEmailBody,
+          customEmailSubject:   doc.customEmailSubject,
         });
       } catch (emailErr) {
         console.error('[sign/submit] Next signer email failed:', emailErr.message);
@@ -1096,7 +1166,29 @@ router.post('/sign/finalize/:docId', async (req, res) => {
   }
 });
 
-// ── 8. GET SINGLE DOCUMENT ──────────────────────────────────────
+// ── 8. GET DOCUMENT PDF (owner preview) ─────────────────────────
+router.get('/:id/pdf', auth, async (req, res) => {
+  try {
+    const doc = await Document.findOne({
+      _id: req.params.id,
+      owner: req.user.id,
+    }).select('fileUrl title localPdfPath signedFileUrl localSignedPdfPath status')
+      .lean();
+
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Document not found.' });
+    }
+
+    const preferSigned = req.query.signed === '1' && doc.status === 'completed';
+    const buffer = await getPdfBytes(doc, { preferSigned });
+    return sendPdf(res, buffer, doc.title);
+  } catch (err) {
+    console.error('[GET /documents/:id/pdf]', err.message);
+    return res.status(502).json({ success: false, message: err.message });
+  }
+});
+
+// ── 9. GET SINGLE DOCUMENT ──────────────────────────────────────
 router.get('/:id', auth, async (req, res) => {
   try {
     const doc = await Document.findOne({
@@ -1158,7 +1250,9 @@ router.get('/:id/audit', auth, async (req, res) => {
           region:     p.region,
           country:    p.country,
           postalCode: p.postalCode,
-          // ✅ FIX: সব parts দিয়ে display বানাও
+          latitude:   p.latitude,
+          longitude:  p.longitude,
+          timezone:   p.timezone,
           display: [p.city, p.region, p.country, p.postalCode]
             .filter(Boolean).join(', '),
         },
@@ -1306,7 +1400,7 @@ async function _finalizeDocument(req, doc) {
     // তাই আলাদা timeout দাও
     console.log(`[finalize] Step 1: Merging signatures...`);
     const mergedBytes = await Promise.race([
-      mergeSignaturesIntoPDF(freshDoc.fileUrl, freshDoc.fields),
+      mergeSignaturesIntoPDF(freshDoc, freshDoc.fields),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error('mergeSignaturesIntoPDF timeout')), 25_000)
       ),
@@ -1347,6 +1441,7 @@ async function _finalizeDocument(req, doc) {
     // ✅ Step 4: Save URL — এটা সবার আগে save করো
     // Email fail হলেও URL save থাকবে
     freshDoc.signedFileUrl = uploaded.secure_url;
+    freshDoc.localSignedPdfPath = savePdfBuffer(finalBuffer, `signed_${freshDoc._id}`);
     await freshDoc.save();
     console.log(`[finalize] signedFileUrl saved to DB`);
 

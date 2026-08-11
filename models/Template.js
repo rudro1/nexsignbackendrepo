@@ -54,7 +54,12 @@ const BossSignatureSchema = new mongoose.Schema({
   signedAt:          { type: Date,   default: null },
   ipAddress:         { type: String, default: '' },
   city:              { type: String, default: '' },
+  region:            { type: String, default: '' },
   country:           { type: String, default: '' },
+  postalCode:        { type: String, default: '' },
+  timezone:          { type: String, default: '' },
+  latitude:          { type: String, default: '' },
+  longitude:         { type: String, default: '' },
   device:            { type: String, default: '' },
   browser:           { type: String, default: '' },
   os:                { type: String, default: '' },
@@ -98,11 +103,35 @@ const TemplateSchema = new mongoose.Schema({
   // ── Company branding ────────────────────────────
   companyName: { type: String, default: '' },
   companyLogo: { type: String, default: '' },
+  emailHeaderColor: { type: String, default: '#0f172a' },
   message:     { type: String, default: '' },
+
+  // Optional sequential approvers before employee emails (CEO → HR → …)
+  approvers: {
+    type: [{
+      name:        { type: String, required: true, trim: true },
+      email:       { type: String, required: true, lowercase: true, trim: true },
+      designation: { type: String, default: '' },
+      order:       { type: Number, default: 0 },
+      token:       { type: String, required: true },
+      status:      {
+        type:    String,
+        enum:    ['pending', 'approved', 'declined'],
+        default: 'pending',
+      },
+      approvedAt:    { type: Date, default: null },
+      declineReason: { type: String, default: '' },
+      note:          { type: String, default: '' },
+    }],
+    default: [],
+  },
+  currentApproverIndex: { type: Number, default: -1 },
 
   // ── PDF files ───────────────────────────────────
   fileUrl:      { type: String, required: [true, 'PDF file URL is required'] },
   filePublicId: { type: String, default: '' },
+  localPdfPath:       { type: String, default: null },
+  localBossSignedPdfPath: { type: String, default: null },
   fileName:     { type: String, default: '' },
   fileSize:     { type: Number, default: 0 },
 
@@ -141,12 +170,13 @@ const TemplateSchema = new mongoose.Schema({
   // ── Status ───────────────────────────────────────
   status: {
     type:    String,
-    enum:    ['draft', 'boss_pending', 'active', 'completed', 'archived'],
+    enum:    ['draft', 'boss_pending', 'approver_pending', 'active', 'completed', 'archived'],
     default: 'draft',
     index:   true,
     /*
       draft        → created, not configured
       boss_pending → boss needs to sign first
+      approver_pending → boss signed; approver chain in progress
       active       → boss signed, employees signing
       completed    → all employees signed
       archived     → manually archived
@@ -165,6 +195,9 @@ const TemplateSchema = new mongoose.Schema({
     reminderDays:   { type: Number,  default: 3     },
     emailSubject:   { type: String,  default: ''    },
     emailMessage:   { type: String,  default: ''    },
+    useCustomEmailBody: { type: Boolean, default: false },
+    customEmailBody:    { type: String,  default: '' },
+    customEmailSubject: { type: String,  default: '' },
   },
 
   // ── Stats (denormalized) ─────────────────────────
