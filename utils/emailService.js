@@ -2462,6 +2462,16 @@ const EMAIL_CONFIG = {
     hasPdf:      false,
   },
 
+  declined_notification: {
+    subject:     d => `"${d.docTitle}" was declined by ${d.signerName}`,
+    heroIcon:    'clock',
+    iconBg:      '#FEF2F2',
+    heroTitle:   () => `A signer declined your document`,
+    heroMessage: d => `Hello ${d.signerName || 'there'},<br><br><strong>${d.declinerName || 'A signer'}</strong> declined to sign <strong>"${d.docTitle}"</strong>.${d.reason ? `<br><br>Reason: ${d.reason}` : ''}`,
+    showButton:  false,
+    hasPdf:      false,
+  },
+
 };
 
 // ─── Icon SVG map ─────────────────────────────────────────────────────────────
@@ -2768,13 +2778,49 @@ async function sendEmail(type, data, attachments = []) {
 
 async function sendSigningEmail(data) {
   return sendEmail('signing_request', {
-    to:           data.recipientEmail,
-    recipientName: data.recipientName,
-    senderName:    data.senderName,
-    documentTitle: data.documentTitle,
-    signingLink:   data.signingLink,
-    companyLogo:   data.companyLogoUrl,
-    companyName:   data.companyName,
+    to:          data.recipientEmail,
+    signerName:  data.recipientName,
+    senderName:  data.senderName,
+    senderEmail: data.senderEmail,
+    docTitle:    data.documentTitle,
+    actionUrl:   data.signingLink || data.actionUrl,
+    companyLogo: data.companyLogoUrl,
+    companyName: data.companyName || 'NexSign',
+  });
+}
+
+async function sendBossApprovalEmail(data) {
+  return sendEmail('signing_request', {
+    to:          data.bossEmail,
+    signerName:  data.bossName,
+    senderName:  data.senderName || data.bossName,
+    docTitle:    data.documentTitle,
+    actionUrl:   data.signingLink,
+    companyLogo: data.companyLogoUrl,
+    companyName: data.companyName || 'NexSign',
+  });
+}
+
+async function sendEmployeeSigningEmail(data) {
+  return sendEmail('signing_request', {
+    to:          data.employeeEmail,
+    signerName:  data.employeeName,
+    senderName:  data.bossName,
+    docTitle:    data.documentTitle,
+    actionUrl:   data.signingLink,
+    companyLogo: data.companyLogoUrl,
+    companyName: data.companyName || 'NexSign',
+  });
+}
+
+async function sendDeclinedEmail(data) {
+  return sendEmail('declined_notification', {
+    to:           data.ownerEmail,
+    signerName:   data.ownerName,
+    declinerName: data.signerName,
+    docTitle:     data.title || data.documentTitle,
+    reason:       data.reason || '',
+    companyName:  'NexSign',
   });
 }
 
@@ -2788,32 +2834,36 @@ async function sendCompletionEmail(data) {
   }
 
   return sendEmail(data.isCC ? 'cc_notification' : 'completion', {
-    to:           data.recipientEmail,
-    recipientName: data.recipientName,
-    documentTitle: data.documentTitle,
-    signedPdfUrl:  data.signedPdfUrl,
-    companyLogo:   data.companyLogoUrl,
-    companyName:   data.companyName,
+    to:          data.recipientEmail,
+    signerName:  data.recipientName,
+    docTitle:    data.documentTitle,
+    signedPdfUrl: data.signedPdfUrl,
+    companyLogo: data.companyLogoUrl,
+    companyName: data.companyName || 'NexSign',
   }, attachments);
 }
 
 async function sendCCEmail(data) {
   return sendEmail('cc_notification', {
-    to:           data.recipientEmail,
-    recipientName: data.recipientName,
-    senderName:    data.senderName,
-    documentTitle: data.documentTitle,
-    companyLogo:   data.companyLogoUrl,
-    companyName:   data.companyName,
+    to:          data.recipientEmail,
+    signerName:  data.recipientName || data.ccName,
+    ccName:      data.recipientName,
+    senderName:  data.senderName,
+    docTitle:    data.documentTitle,
+    companyLogo: data.companyLogoUrl,
+    companyName: data.companyName || 'NexSign',
   });
 }
 
-module.exports = { 
-  sendEmail, 
+module.exports = {
+  sendEmail,
   sendSigningEmail,
+  sendBossApprovalEmail,
+  sendEmployeeSigningEmail,
+  sendDeclinedEmail,
   sendCompletionEmail,
   sendCCEmail,
-  EMAIL_CONFIG, 
-  getDocumentSubtitle, 
-  buildEmailHtml 
+  EMAIL_CONFIG,
+  getDocumentSubtitle,
+  buildEmailHtml,
 };
