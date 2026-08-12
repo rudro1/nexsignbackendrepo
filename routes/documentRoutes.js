@@ -905,7 +905,7 @@ router.get('/sign/:token/pdf', async (req, res) => {
   try {
     const doc = await Document
       .findOne({ 'parties.token': req.params.token })
-      .select('fileUrl title localPdfPath signedFileUrl localSignedPdfPath')
+      .select('fileUrl fileId signedFileId title localPdfPath signedFileUrl localSignedPdfPath')
       .lean();
 
     if (!doc) return res.status(404).send('Not found');
@@ -1180,7 +1180,7 @@ router.get('/:id/pdf', auth, async (req, res) => {
     const doc = await Document.findOne({
       _id: req.params.id,
       owner: req.user.id,
-    }).select('fileUrl title localPdfPath signedFileUrl localSignedPdfPath status')
+    }).select('fileUrl fileId signedFileId title localPdfPath signedFileUrl localSignedPdfPath status')
       .lean();
 
     if (!doc) {

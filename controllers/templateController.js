@@ -447,7 +447,10 @@ const createTemplate = asyncHandler(async (req, res) => {
   });
 
   try {
-    const bytes = await getPdfBytes({ fileUrl: template.fileUrl });
+    const bytes = await getPdfBytes({
+      fileUrl:      template.fileUrl,
+      filePublicId: template.filePublicId,
+    });
     template.localPdfPath = savePdfBuffer(bytes, String(template._id));
     await template.save();
   } catch (cacheErr) {

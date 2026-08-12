@@ -30,20 +30,70 @@ function getCloudinary() {
   return cloudinary;
 }
 
+/** Parse Cloudinary public_id from a secure_url (fallback when fileId not loaded). */
+function extractCloudinaryPublicId(url) {
+  if (!url || typeof url !== 'string' || !url.includes('cloudinary.com')) return null;
+  try {
+    const pathname = new URL(url).pathname;
+    const marker = '/upload/';
+    const idx = pathname.indexOf(marker);
+    if (idx === -1) return null;
+    let rest = pathname.slice(idx + marker.length);
+    if (rest.startsWith('v') && /^v\d+\//.test(rest)) {
+      rest = rest.replace(/^v\d+\//, '');
+    }
+    return decodeURIComponent(rest) || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveCloudPublicId(record, { preferSigned = false } = {}) {
+  if (!record) return null;
+  if (preferSigned && record.signedFileId) return record.signedFileId;
+  if (record.filePublicId) return record.filePublicId;
+  if (record.fileId) return record.fileId;
+  if (preferSigned && record.signedFileUrl) {
+    const fromSigned = extractCloudinaryPublicId(record.signedFileUrl);
+    if (fromSigned) return fromSigned;
+  }
+  if (record.bossSignedFileUrl) {
+    const fromBoss = extractCloudinaryPublicId(record.bossSignedFileUrl);
+    if (fromBoss) return fromBoss;
+  }
+  return extractCloudinaryPublicId(record.fileUrl);
+}
+
 /** Server-side Cloudinary admin download (works when public PDF delivery is blocked). */
 async function fetchFromCloudinary(publicId) {
   const cld = getCloudinary();
   if (!cld || !publicId) return null;
 
-  const id = String(publicId);
-  const url = cld.utils.private_download_url(id, 'pdf', {
-    resource_type: 'raw',
-    type:          'upload',
-  });
+  const base = String(publicId).trim();
+  const ids = [...new Set([
+    base,
+    base.replace(/\.pdf$/i, ''),
+    base.endsWith('.pdf') ? base : `${base}.pdf`,
+  ].filter(Boolean))];
 
-  const res = await fetch(url, { headers: { Accept: 'application/pdf,*/*' } });
-  if (!res.ok) return null;
-  return Buffer.from(await res.arrayBuffer());
+  for (const id of ids) {
+    for (const fmt of ['pdf', '']) {
+      try {
+        const url = cld.utils.private_download_url(id, fmt, {
+          resource_type: 'raw',
+          type:          'upload',
+        });
+        const res = await fetch(url, { headers: { Accept: 'application/pdf,*/*' } });
+        if (!res.ok) continue;
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > 4 && buf.slice(0, 4).toString() === '%PDF') return buf;
+      } catch (err) {
+        console.warn(`[pdfStorage] private_download failed for ${id}:`, err.message);
+      }
+    }
+  }
+
+  return null;
 }
 
 // Vercel/serverless: only /tmp is writable; project uploads/ is read-only
@@ -108,7 +158,7 @@ async function getPdfBytes(record, { preferSigned = false } = {}) {
     if (local) return local;
   }
 
-  const cloudPublicId = record.filePublicId || record.fileId;
+  const cloudPublicId = resolveCloudPublicId(record, { preferSigned });
   if (cloudPublicId) {
     const fromCloud = await fetchFromCloudinary(cloudPublicId);
     if (fromCloud) return fromCloud;
@@ -122,6 +172,14 @@ async function getPdfBytes(record, { preferSigned = false } = {}) {
     throw new Error('PDF file is not available. Please re-upload the document.');
   }
 
+  // Skip doomed public Cloudinary fetch when admin download already failed
+  if (url.includes('cloudinary.com') && cloudPublicId) {
+    throw new Error(
+      'Could not load PDF from Cloudinary. Verify CLOUDINARY_* env vars on the server, ' +
+      'or enable "Allow delivery of PDF and ZIP files" in Cloudinary → Settings → Security.',
+    );
+  }
+
   const res = await fetch(url, { headers: { Accept: 'application/pdf,*/*' } });
   if (res.ok) return Buffer.from(await res.arrayBuffer());
 
@@ -131,6 +189,11 @@ async function getPdfBytes(record, { preferSigned = false } = {}) {
   }
 
   if (res.status === 401) {
+    const extracted = extractCloudinaryPublicId(url);
+    if (extracted) {
+      const signed = await fetchFromCloudinary(extracted);
+      if (signed) return signed;
+    }
     throw new Error(
       'PDF delivery is blocked on Cloudinary for this account. ' +
       'Re-upload the document, or enable "Allow delivery of PDF and ZIP files" ' +
@@ -161,5 +224,7 @@ module.exports = {
   resolveLocalPath,
   getPdfBytes,
   sendPdf,
+  extractCloudinaryPublicId,
+  resolveCloudPublicId,
   PDF_DIR,
 };

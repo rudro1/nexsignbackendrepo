@@ -595,9 +595,10 @@ const getCampaignPdf = asyncHandler(async (req, res) => {
 
   if (campaign) {
     record = {
-      fileUrl: campaign.bossSignedFileUrl || campaign.fileUrl,
-      localPdfPath: campaign.localBossSignedPdfPath || campaign.localPdfPath,
-      bossSignedFileUrl: campaign.bossSignedFileUrl,
+      fileUrl:            campaign.bossSignedFileUrl || campaign.fileUrl,
+      filePublicId:       campaign.filePublicId,
+      localPdfPath:       campaign.localBossSignedPdfPath || campaign.localPdfPath,
+      bossSignedFileUrl:  campaign.bossSignedFileUrl,
     };
     title = campaign.title;
   } else {
@@ -608,9 +609,10 @@ const getCampaignPdf = asyncHandler(async (req, res) => {
     });
     if (template) {
       record = {
-        fileUrl: template.bossSignedFileUrl || template.fileUrl,
-        localPdfPath: template.localBossSignedPdfPath || template.localPdfPath,
-        bossSignedFileUrl: template.bossSignedFileUrl,
+        fileUrl:            template.bossSignedFileUrl || template.fileUrl,
+        filePublicId:       template.filePublicId,
+        localPdfPath:       template.localBossSignedPdfPath || template.localPdfPath,
+        bossSignedFileUrl:  template.bossSignedFileUrl,
       };
       title = template.title;
     }
