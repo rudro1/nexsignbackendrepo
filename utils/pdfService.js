@@ -1446,7 +1446,10 @@ async function fetchPdfBytes(source) {
   if (typeof source === 'object' && source !== null) {
     try {
       const { getPdfBytes } = require('./pdfStorage');
-      const buf = await getPdfBytes(source);
+      const preferSigned = source.preferSigned
+        ?? source.preferBossSigned
+        ?? !!source.bossSignedFileUrl;
+      const buf = await getPdfBytes(source, { preferSigned });
       return new Uint8Array(buf);
     } catch (e) {
       if (!source.fileUrl) throw e;

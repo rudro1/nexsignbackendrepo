@@ -49,7 +49,13 @@ const {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-const EMAIL_BATCH_DELAY_MS = 800;
+/** Vercel/serverless kills setImmediate work after the HTTP response — must await mail on these hosts */
+const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+/** Delay between parallel email chunks (SMTP rate-limit safety) */
+const EMAIL_BATCH_DELAY_MS = 450;
+/** How many signing emails to send concurrently per chunk */
+const EMAIL_BATCH_CONCURRENCY = 3;
 
 async function findTemplateSession({ token, slug, signCode }) {
   if (slug && signCode) {
@@ -111,26 +117,32 @@ function newEmployeeSessionDoc(recipient, templateId, expiresAt, extra = {}) {
   };
 }
 
-/** Send signing emails in background with delay (avoids SMTP rate limits + Vercel timeout) */
-function queueEmployeeSessionEmails({
+/**
+ * Send signing emails to ALL employees in parallel chunks.
+ * Returns counts so callers can report accurate delivery status.
+ */
+async function sendEmployeeSessionEmailBatch({
   sessions,
   template,
   bossUser,
   req,
   dispatchFn = dispatchEmployeeEmail,
 }) {
-  setImmediate(async () => {
-    const failed = [];
-    let emailsSent = 0;
+  const failed = [];
+  let emailsSent = 0;
+  const total = sessions.length;
 
-    for (let i = 0; i < sessions.length; i++) {
-      const session = sessions[i];
+  for (let i = 0; i < total; i += EMAIL_BATCH_CONCURRENCY) {
+    const chunk = sessions.slice(i, i + EMAIL_BATCH_CONCURRENCY);
+
+    await Promise.all(chunk.map(async (session, j) => {
+      const idx = i + j + 1;
       try {
         const result = await dispatchFn({ session, template, bossUser });
         await recordSessionEmailResult(session, result);
         if (result?.success) {
           emailsSent += 1;
-          console.log(`[emailBatch] Sent to ${session.recipientEmail} (${i + 1}/${sessions.length})`);
+          console.log(`[emailBatch] Sent to ${session.recipientEmail} (${idx}/${total})`);
         } else {
           failed.push({
             name:  session.recipientName,
@@ -146,39 +158,71 @@ function queueEmployeeSessionEmails({
           error: e.message,
         });
       }
-      if (i < sessions.length - 1) await sleep(EMAIL_BATCH_DELAY_MS);
-    }
+    }));
 
-    const emailsFailed = failed.length;
-    if (emailsFailed > 0) {
-      console.error(`[emailBatch] ${emailsFailed}/${sessions.length} emails failed`);
-      try {
-        await sendEmailDeliveryFailureNotice?.({
-          ownerEmail: bossUser.email,
-          ownerName:  bossUser.full_name || bossUser.name || 'Template Owner',
-          docTitle:   template.title,
-          failed,
-          totalCount: sessions.length,
-        });
-      } catch (noticeErr) {
-        console.error('[emailBatch] Owner notice failed:', noticeErr.message);
-      }
-      emitSocket(req, 'template:email_failed', {
-        templateId: String(template._id),
-        ownerId:    String(bossUser._id || bossUser.id),
+    if (i + EMAIL_BATCH_CONCURRENCY < total) {
+      await sleep(EMAIL_BATCH_DELAY_MS);
+    }
+  }
+
+  if (failed.length > 0) {
+    console.error(`[emailBatch] ${failed.length}/${total} emails failed`);
+    try {
+      await sendEmailDeliveryFailureNotice?.({
+        ownerEmail: bossUser.email,
+        ownerName:  bossUser.full_name || bossUser.name || 'Template Owner',
+        docTitle:   template.title,
         failed,
-        emailsSent,
-        totalCount: sessions.length,
+        totalCount: total,
       });
+    } catch (noticeErr) {
+      console.error('[emailBatch] Owner notice failed:', noticeErr.message);
     }
-
-    emitSocket(req, 'template:employees_emailed', {
+    emitSocket(req, 'template:email_failed', {
       templateId: String(template._id),
       ownerId:    String(bossUser._id || bossUser.id),
+      failed,
       emailsSent,
-      totalCount: sessions.length,
+      totalCount: total,
+    });
+  }
+
+  emitSocket(req, 'template:employees_emailed', {
+    templateId: String(template._id),
+    ownerId:    String(bossUser._id || bossUser.id),
+    emailsSent,
+    totalCount: total,
+  });
+
+  return {
+    emailsSent,
+    emailsFailed: failed.length,
+    failedRecipients: failed,
+    totalCount: total,
+    emailsQueued: false,
+  };
+}
+
+/**
+ * Queue or await employee signing emails.
+ * On Vercel/serverless we MUST await — background setImmediate is killed after res.json().
+ */
+async function queueEmployeeSessionEmails(opts) {
+  if (IS_SERVERLESS) {
+    return sendEmployeeSessionEmailBatch(opts);
+  }
+  setImmediate(() => {
+    sendEmployeeSessionEmailBatch(opts).catch(err => {
+      console.error('[emailBatch] background failed:', err.message);
     });
   });
+  return {
+    emailsSent:       0,
+    emailsQueued:     true,
+    emailsFailed:     0,
+    failedRecipients: [],
+    totalCount:       opts.sessions?.length || 0,
+  };
 }
 
 function resolveTemplateLogo(template, ownerUser) {
@@ -304,13 +348,43 @@ async function distributeTemplateEmployees(template, bossUser, req) {
 
   await ensureTemplatePublicSlug(template);
 
-  const sessionDocs = template.recipients.map(r =>
-    newEmployeeSessionDoc(r, template._id, expiresAt),
-  );
+  const existingSessions = await TemplateSession.find({
+    $or:       [{ template: template._id }, { templateId: template._id }],
+    isDeleted: { $ne: true },
+  });
 
-  const sessions = await TemplateSession.insertMany(sessionDocs);
+  let sessions = existingSessions;
 
-  queueEmployeeSessionEmails({ sessions, template, bossUser, req });
+  if (!existingSessions.length) {
+    const sessionDocs = template.recipients.map(r =>
+      newEmployeeSessionDoc(r, template._id, expiresAt),
+    );
+    sessions = await TemplateSession.insertMany(sessionDocs);
+  } else {
+    const needResend = existingSessions.filter(
+      s => !s.emailDelivered && ['pending', 'viewed', 'expired'].includes(s.status),
+    );
+    if (needResend.length) {
+      sessions = needResend;
+    } else if (existingSessions.every(s => s.emailDelivered)) {
+      template.status = 'active';
+      template.sentAt = template.sentAt || new Date();
+      await template.save();
+      return {
+        phase:            'active',
+        sessionsCount:    existingSessions.length,
+        emailsSent:       0,
+        emailsQueued:     false,
+        emailsFailed:     0,
+        failedRecipients: [],
+        message:          'Signing links were already sent to all employees.',
+      };
+    }
+  }
+
+  const emailResult = await queueEmployeeSessionEmails({
+    sessions, template, bossUser, req,
+  });
 
   template.status = 'active';
   template.sentAt = template.sentAt || new Date();
@@ -318,20 +392,27 @@ async function distributeTemplateEmployees(template, bossUser, req) {
   await template.save();
 
   emitSocket(req, 'template:activated', {
-    templateId:  String(template._id),
-    ownerId:     String(bossUser._id || bossUser.id),
-    title:       template.title,
-    totalCount:  sessions.length,
-    emailsQueued: true,
+    templateId:   String(template._id),
+    ownerId:      String(bossUser._id || bossUser.id),
+    title:        template.title,
+    totalCount:   sessions.length,
+    emailsQueued: emailResult.emailsQueued,
+    emailsSent:   emailResult.emailsSent,
   });
 
+  const sent = emailResult.emailsSent ?? 0;
+  const failed = emailResult.emailsFailed ?? 0;
+
   return {
-    phase:         'active',
-    sessionsCount: sessions.length,
-    emailsSent:    0,
-    emailsQueued:  true,
-    emailsFailed:  0,
-    failedRecipients: [],
+    phase:            'active',
+    sessionsCount:    sessions.length,
+    emailsSent:       sent,
+    emailsQueued:     emailResult.emailsQueued,
+    emailsFailed:     failed,
+    failedRecipients: emailResult.failedRecipients || [],
+    message:          failed
+      ? `Sent ${sent}/${sessions.length} signing emails. ${failed} failed — use Resend Failed on the template page.`
+      : `Signing links sent to ${sent} employee(s).`,
   };
 }
 
@@ -857,7 +938,9 @@ async function advanceTemplateAfterBossSign(template, bossUser, req, auditMeta =
 
   const sessions = await TemplateSession.insertMany(sessionDocs);
 
-  queueEmployeeSessionEmails({ sessions, template, bossUser, req });
+  const emailResult = await queueEmployeeSessionEmails({
+    sessions, template, bossUser, req,
+  });
 
   safeAuditLog({
     action:         'boss_signed_template',
@@ -885,12 +968,12 @@ async function advanceTemplateAfterBossSign(template, bossUser, req, auditMeta =
   return {
     phase:            'active',
     sessionsCount:    sessions.length,
-    emailsSent:       0,
-    emailsQueued:     true,
-    emailsFailed:     0,
-    failedRecipients: [],
+    emailsSent:       emailResult.emailsSent ?? 0,
+    emailsQueued:     emailResult.emailsQueued,
+    emailsFailed:     emailResult.emailsFailed ?? 0,
+    failedRecipients: emailResult.failedRecipients || [],
     template:         template.toJSON(),
-    message:          `Boss signed! Sending signing links to ${sessions.length} employees…`,
+    message:          `Boss signed! Signing links sent to ${emailResult.emailsSent ?? 0}/${sessions.length} employees.`,
   };
 }
 
@@ -987,7 +1070,7 @@ const getTemplateSessions = asyncHandler(async (req, res) => {
   const { status, page = 1, limit = 50, search } = req.query;
 
   const filter = {
-    template:  template._id,
+    $or:       [{ template: template._id }, { templateId: template._id }],
     isDeleted: { $ne: true },
   };
   if (status && status !== 'all') filter.status = status;
@@ -1316,35 +1399,67 @@ function buildBossPdfSource(template) {
     filePublicId:       template.filePublicId,
     localPdfPath:       template.localPdfPath,
     localSignedPdfPath: template.localBossSignedPdfPath,
+    localBossSignedPdfPath: template.localBossSignedPdfPath,
     bossSignedFileUrl:  template.bossSignedFileUrl,
+    preferSigned:       !!template.bossSignedFileUrl,
   };
 }
 
-/** Build merged field list (boss + employee) with values for PDF embedding */
+/** Normalize session to plain object for PDF field lookup */
+function toSessionPlain(session) {
+  if (!session) return {};
+  return session.toObject ? session.toObject() : { ...session };
+}
+
+/** fieldId → value map (supports legacy id key) */
+function buildFieldValueMap(fieldValues = []) {
+  const map = new Map();
+  for (const raw of fieldValues) {
+    const v = raw?.toObject ? raw.toObject() : raw;
+    if (!v) continue;
+    const key = v.fieldId || v.id;
+    if (key != null && String(key)) {
+      map.set(String(key), v);
+    }
+  }
+  return map;
+}
+
+function resolveEmployeeSignatureValue(session, field, valueMap, signatureDataUrl = null) {
+  const fromMap = valueMap.get(String(field.id))?.value;
+  const candidate = signatureDataUrl
+    || session.signatureImageUrl
+    || fromMap
+    || null;
+  if (typeof candidate === 'string' && !candidate.trim()) return null;
+  return candidate;
+}
+
+/**
+ * Build employee field overlay list for PDF embedding.
+ * Boss fields are already embedded in bossSignedFileUrl — only employee fields are merged.
+ */
 function buildTemplateFieldsWithValues(template, session, { signatureDataUrl = null } = {}) {
-  const bossSigUrl = template.bossSignature?.signatureImageUrl || null;
+  const plainSession = toSessionPlain(session);
+  const valueMap     = buildFieldValueMap(plainSession.fieldValues);
 
   return (template.fields || [])
-    .filter(f => f.assignedTo === 'boss' || f.assignedTo === 'employee')
+    .filter(f => f.assignedTo === 'employee')
     .map(field => {
       const plain = field.toObject ? field.toObject() : { ...field };
 
-      if (plain.assignedTo === 'boss') {
-        if (plain.type === 'signature' || plain.type === 'initial') {
-          return { ...plain, value: bossSigUrl || plain.value || null };
-        }
-        return { ...plain, value: plain.value || null };
-      }
-
-      // employee fields
       if (plain.type === 'signature' || plain.type === 'initial') {
         return {
           ...plain,
-          value: signatureDataUrl || session.signatureImageUrl || plain.value || null,
+          value: resolveEmployeeSignatureValue(
+            plainSession, plain, valueMap, signatureDataUrl,
+          ),
         };
       }
-      const fv = (session.fieldValues || []).find(v => v.fieldId === plain.id);
-      return { ...plain, value: fv?.value || plain.value || null };
+
+      const fv = valueMap.get(String(plain.id));
+      const value = fv?.value ?? null;
+      return { ...plain, value: (value != null && String(value).trim()) ? String(value) : null };
     });
 }
 
@@ -1355,6 +1470,18 @@ async function buildEmployeeSessionPdf(session, template, { signatureDataUrl = n
   }
 
   const fieldsWithValues = buildTemplateFieldsWithValues(template, session, { signatureDataUrl });
+  const embeddedCount    = fieldsWithValues.filter(
+    f => f.value != null && String(f.value).trim(),
+  ).length;
+
+  if (embeddedCount === 0) {
+    const plain = toSessionPlain(session);
+    console.warn(
+      `[buildEmployeeSessionPdf] No employee field values to embed for ${plain.recipientEmail}`,
+      `(fieldValues=${(plain.fieldValues || []).length}, sigUrl=${!!plain.signatureImageUrl},`,
+      `sigDataUrl=${!!signatureDataUrl})`,
+    );
+  }
 
   const ownerUser = await resolveTemplateOwnerUser(template);
 
@@ -1455,9 +1582,10 @@ async function persistEmployeeSessionPdf(session, pdfBuffer) {
 }
 
 /** Ensure signed session has a stored PDF; (re)generate to include all signatures */
-async function ensureEmployeeSessionPdf(session, template) {
-  const { pdfBuffer } = await buildEmployeeSessionPdf(session, template);
-  return persistEmployeeSessionPdf(session, pdfBuffer);
+async function ensureEmployeeSessionPdf(session, template, { signatureDataUrl = null } = {}) {
+  const { pdfBuffer } = await buildEmployeeSessionPdf(session, template, { signatureDataUrl });
+  await persistEmployeeSessionPdf(session, pdfBuffer);
+  return { session, pdfBuffer };
 }
 
 // ════════════════════════════════════════════════════
@@ -1560,11 +1688,202 @@ const getSessionByPrettyLink = asyncHandler(async (req, res) =>
 // 9. EMPLOYEE SIGN (public)
 // POST /api/templates/sign/submit/:token
 // ════════════════════════════════════════════════════
+/** Post-sign work: PDF, signed-copy email, stats, audit (must complete on serverless) */
+async function finalizeEmployeeSign({
+  session,
+  template,
+  signatureDataUrl,
+  parsedFieldValues,
+  ip,
+  ua,
+  geo,
+  deviceInfo,
+  localTime,
+  req,
+}) {
+  let signatureImageUrl      = null;
+  let signatureImagePublicId = '';
+
+  if (signatureDataUrl) {
+    for (let attempt = 1; attempt <= 2 && !signatureImageUrl; attempt++) {
+      try {
+        const uploaded = await uploadSignaturePng(
+          signatureDataUrl,
+          'nexsign/employee-signatures',
+        );
+        signatureImageUrl      = uploaded.secure_url;
+        signatureImagePublicId = uploaded.public_id;
+      } catch (e) {
+        console.error(
+          `[employeeSign] Signature upload attempt ${attempt} failed:`,
+          e.message,
+        );
+      }
+    }
+  }
+
+  await session.markSigned({
+    signatureImageUrl,
+    signatureImagePublicId,
+    fieldValues: parsedFieldValues,
+    meta: {
+      ipAddress:  ip,
+      userAgent:  ua,
+      location:   geo,
+      deviceInfo,
+      localTime,
+    },
+  });
+
+  const freshSession  = await TemplateSession.findById(session._id);
+  const activeSession = freshSession || session;
+
+  let signedFileUrl = null;
+  let pdfBuffer     = null;
+  let sessionDoc    = null;
+
+  try {
+    const built = await buildEmployeeSessionPdf(
+      activeSession, template, { signatureDataUrl },
+    );
+    pdfBuffer  = built.pdfBuffer;
+    sessionDoc = built.sessionDoc;
+    await persistEmployeeSessionPdf(activeSession, pdfBuffer);
+    signedFileUrl = activeSession.signedFileUrl;
+  } catch (e) {
+    console.error('[employeeSign] PDF generation failed:', e.message);
+    try {
+      const rebuilt = await buildEmployeeSessionPdf(
+        activeSession, template, { signatureDataUrl },
+      );
+      pdfBuffer  = rebuilt.pdfBuffer;
+      sessionDoc = rebuilt.sessionDoc;
+      await persistEmployeeSessionPdf(activeSession, pdfBuffer);
+      signedFileUrl = activeSession.signedFileUrl;
+    } catch (retryErr) {
+      console.error('[employeeSign] PDF retry failed:', retryErr.message);
+    }
+  }
+
+  let freshTemplate = null;
+  try {
+    const templateDoc = await Template.findById(template._id);
+    if (templateDoc) {
+      freshTemplate = await templateDoc.recalculateStats();
+    }
+  } catch (e) {
+    console.error('[employeeSign] Stats update failed:', e.message);
+    freshTemplate = await Template.findById(template._id);
+  }
+
+  const owner = await resolveTemplateOwnerUser(template);
+  const signedPdfUrlForEmail = signedFileUrl || activeSession.signedFileUrl || '';
+  const partiesForEmail      = sessionDoc?.parties || [];
+
+  try {
+    await deliverEmployeeSignedCopyEmail({
+      session:     activeSession,
+      templateCtx: template,
+      ownerUser:   owner,
+      pdfBuffer,
+      sessionDoc,
+    });
+  } catch (e) {
+    console.error('[employeeSign] Signed copy email failed:', e.message);
+  }
+
+  if (freshTemplate?.status === 'completed') {
+    try {
+      let emailPdfBuffer = pdfBuffer;
+      if (!emailPdfBuffer) {
+        try {
+          emailPdfBuffer = await loadEmployeeSessionPdfBytes(activeSession);
+        } catch (e) {
+          console.error('[employeeSign] Owner/CC PDF load failed:', e.message);
+        }
+      }
+
+      await sendCompletionEmail?.({
+        recipientEmail:   owner?.email,
+        recipientName:    owner?.full_name || 'Owner',
+        documentTitle:    template.title,
+        pdfBuffer:        emailPdfBuffer || null,
+        signedPdfUrl:     signedPdfUrlForEmail,
+        companyName:      template.companyName || '',
+        companyLogoUrl:   resolveTemplateLogo(template, owner),
+        ownerCompanyLogo: owner?.company_logo || '',
+        emailHeaderColor: template.emailHeaderColor,
+        parties:          partiesForEmail,
+      });
+
+      await Promise.allSettled(
+        (template.ccList || []).map(cc =>
+          sendCompletionEmail?.({
+            recipientEmail:   cc.email,
+            recipientName:    cc.name || cc.email,
+            documentTitle:    template.title,
+            pdfBuffer:        emailPdfBuffer || null,
+            signedPdfUrl:     signedPdfUrlForEmail,
+            companyName:      template.companyName || '',
+            companyLogoUrl:   resolveTemplateLogo(template, owner),
+            ownerCompanyLogo: owner?.company_logo || '',
+            emailHeaderColor: template.emailHeaderColor,
+            isCC:             true,
+            parties:          partiesForEmail,
+          }),
+        ),
+      );
+    } catch (e) {
+      console.error('[employeeSign] Owner/CC email failed:', e.message);
+    }
+  }
+
+  safeAuditLog({
+    action:         'employee_signed_template',
+    document_id:    template._id,
+    template_id:    template._id,
+    session_id:     session._id,
+    document_title: template.title,
+    performed_by: {
+      name:  session.recipientName,
+      email: session.recipientEmail,
+      role:  'employee',
+    },
+    device: {
+      device_name: deviceInfo.device,
+      device_type: deviceInfo.deviceType || (deviceInfo.isMobile ? 'mobile' : 'desktop'),
+      browser:     deviceInfo.browser,
+      os:          deviceInfo.os,
+    },
+    location:   toAuditLocation(geo, ip),
+    local_time: localTime,
+  });
+
+  emitSocket(
+    req,
+    'template:employee_signed',
+    {
+      templateId:    String(template._id),
+      sessionId:     String(session._id),
+      ownerId:       String(template.owner),
+      signerName:    session.recipientName,
+      signerEmail:   session.recipientEmail,
+      signedFileUrl: signedPdfUrlForEmail || null,
+      signedCount:   freshTemplate?.stats?.signed || 0,
+      totalCount:    freshTemplate?.stats?.totalRecipients || 0,
+    },
+  );
+}
+
 const employeeSign = asyncHandler(async (req, res) => {
   const {
-    signatureDataUrl, fieldValues,
+    signatureDataUrl: rawSignatureDataUrl, fieldValues,
     latitude, longitude, clientTime, auditMeta,
   } = req.body;
+
+  const signatureDataUrl = typeof rawSignatureDataUrl === 'string'
+    ? rawSignatureDataUrl.trim()
+    : rawSignatureDataUrl;
 
   const ref = req.params.slug
     ? { slug: req.params.slug, signCode: req.params.signCode }
@@ -1648,202 +1967,46 @@ const employeeSign = asyncHandler(async (req, res) => {
     });
   }
 
-  // ── Respond immediately to user ────────────────────
+  const finalizeOpts = {
+    session,
+    template,
+    signatureDataUrl,
+    parsedFieldValues,
+    ip,
+    ua,
+    geo,
+    deviceInfo,
+    localTime,
+    req,
+  };
+
+  if (IS_SERVERLESS) {
+    try {
+      await finalizeEmployeeSign(finalizeOpts);
+    } catch (err) {
+      console.error('[employeeSign]', err.message, err.stack);
+      return res.status(502).json({
+        success: false,
+        message: 'Signature recorded but PDF/email delivery failed. Please contact the sender.',
+      });
+    }
+    return res.json({
+      success:  true,
+      message:  'Document signed successfully! A copy has been emailed to you.',
+      signedAt: new Date(),
+    });
+  }
+
   res.json({
     success:   true,
     message:   'Document signed successfully! A copy will be emailed to you.',
     signedAt:  new Date(),
   });
 
-  // ══════════════════════════════════════════════════
-  // BACKGROUND — PDF generation + emails
-  // ══════════════════════════════════════════════════
-  setImmediate(async () => {
-    try {
-
-      // ── Step 1: Upload signature to Cloudinary ──────
-      let signatureImageUrl      = null;
-      let signatureImagePublicId = '';
-
-      if (signatureDataUrl) {
-        try {
-          const uploaded        = await uploadSignaturePng(
-            signatureDataUrl,
-            'nexsign/employee-signatures',
-          );
-          signatureImageUrl      = uploaded.secure_url;
-          signatureImagePublicId = uploaded.public_id;
-        } catch (e) {
-          console.error('[employeeSign] Signature upload failed:', e.message);
-          // signatureDataUrl থেকেই embed করব
-        }
-      }
-
-      // ── Step 2: Mark session as signed ─────────────
-      await session.markSigned({
-        signatureImageUrl,
-        signatureImagePublicId,
-        fieldValues: parsedFieldValues,
-        meta: {
-          ipAddress:  ip,
-          userAgent:  ua,
-          location:   geo,
-          deviceInfo,
-          localTime,
-        },
-      });
-
-      const freshSession = await TemplateSession.findById(session._id);
-      const activeSession = freshSession || session;
-
-      // ── Step 3–5: Generate & store signed PDF ───────
-      let signedFileUrl = null;
-      let pdfBuffer     = null;
-      let sessionDoc    = null;
-
-      try {
-        const built = await buildEmployeeSessionPdf(
-          activeSession, template, { signatureDataUrl },
-        );
-        pdfBuffer  = built.pdfBuffer;
-        sessionDoc = built.sessionDoc;
-        await persistEmployeeSessionPdf(activeSession, pdfBuffer);
-        signedFileUrl = activeSession.signedFileUrl;
-      } catch (e) {
-        console.error('[employeeSign] PDF generation failed:', e.message);
-        try {
-          await ensureEmployeeSessionPdf(activeSession, template);
-          pdfBuffer = await loadEmployeeSessionPdfBytes(activeSession);
-          const rebuilt = await buildEmployeeSessionPdf(
-            activeSession, template, { signatureDataUrl },
-          );
-          sessionDoc = rebuilt.sessionDoc;
-          signedFileUrl = activeSession.signedFileUrl;
-        } catch (retryErr) {
-          console.error('[employeeSign] PDF retry failed:', retryErr.message);
-        }
-      }
-
-      // ── Step 6: Update template stats ──────────────
-      let freshTemplate = null;
-      try {
-        const templateDoc = await Template.findById(template._id);
-        if (templateDoc) {
-          freshTemplate = await templateDoc.recalculateStats();
-        }
-      } catch (e) {
-        console.error('[employeeSign] Stats update failed:', e.message);
-        freshTemplate = await Template.findById(template._id);
-      }
-
-      const owner = await resolveTemplateOwnerUser(template);
-
-      const signedPdfUrlForEmail = signedFileUrl || activeSession.signedFileUrl || '';
-      const partiesForEmail      = sessionDoc?.parties || [];
-
-      // ── Step 7: Signed copy email to employee ───────
-      try {
-        await deliverEmployeeSignedCopyEmail({
-          session:    activeSession,
-          templateCtx: template,
-          ownerUser:  owner,
-          pdfBuffer,
-          sessionDoc,
-        });
-      } catch (e) {
-        console.error('[employeeSign] Signed copy email failed:', e.message);
-      }
-
-      // ── Step 8: If all signed → owner + CC emails ──
-      if (freshTemplate?.status === 'completed') {
-        try {
-          let emailPdfBuffer = pdfBuffer;
-          if (!emailPdfBuffer) {
-            try {
-              emailPdfBuffer = await loadEmployeeSessionPdfBytes(activeSession);
-            } catch (e) {
-              console.error('[employeeSign] Owner/CC PDF load failed:', e.message);
-            }
-          }
-
-          // Owner notification when all employees have signed
-          await sendCompletionEmail?.({
-            recipientEmail:   owner?.email,
-            recipientName:    owner?.full_name || 'Owner',
-            documentTitle:    template.title,
-            pdfBuffer:        emailPdfBuffer || null,
-            signedPdfUrl:     signedPdfUrlForEmail,
-            companyName:      template.companyName || '',
-            companyLogoUrl:   resolveTemplateLogo(template, owner),
-            ownerCompanyLogo: owner?.company_logo || '',
-            emailHeaderColor: template.emailHeaderColor,
-            parties:          partiesForEmail,
-          });
-
-          // CC emails with PDF attachment
-          await Promise.allSettled(
-            (template.ccList || []).map(cc =>
-              sendCompletionEmail?.({
-                recipientEmail:   cc.email,
-                recipientName:    cc.name || cc.email,
-                documentTitle:    template.title,
-                pdfBuffer:        emailPdfBuffer || null,
-                signedPdfUrl:     signedPdfUrlForEmail,
-                companyName:      template.companyName || '',
-                companyLogoUrl:   resolveTemplateLogo(template, owner),
-                ownerCompanyLogo: owner?.company_logo || '',
-                emailHeaderColor: template.emailHeaderColor,
-                isCC:             true,
-                parties:          partiesForEmail,
-              }),
-            ),
-          );
-        } catch (e) {
-          console.error('[employeeSign] Owner/CC email failed:', e.message);
-        }
-      }
-
-      // ── Step 9: Audit log ───────────────────────────
-      safeAuditLog({
-        action:         'employee_signed_template',
-        document_id:    template._id,
-        template_id:    template._id,
-        session_id:     session._id,
-        document_title: template.title,
-        performed_by: {
-          name:  session.recipientName,
-          email: session.recipientEmail,
-          role:  'employee',
-        },
-        device: {
-          device_name: deviceInfo.device,
-          device_type: deviceInfo.deviceType || (deviceInfo.isMobile ? 'mobile' : 'desktop'),
-          browser:     deviceInfo.browser,
-          os:          deviceInfo.os,
-        },
-        location:     toAuditLocation(geo, ip),
-        local_time:   localTime,
-      });
-
-      // ── Step 10: Socket emit ────────────────────────
-      emitSocket(
-        { app: { get: () => null } },
-        'template:employee_signed',
-        {
-          templateId:    String(template._id),
-          sessionId:     String(session._id),
-          ownerId:       String(template.owner),
-          signerName:    session.recipientName,
-          signerEmail:   session.recipientEmail,
-          signedFileUrl: signedPdfUrlForEmail || null,
-          signedCount:   freshTemplate?.stats?.signed || 0,
-          totalCount:    freshTemplate?.stats?.totalRecipients || 0,
-        },
-      );
-
-    } catch (err) {
+  setImmediate(() => {
+    finalizeEmployeeSign(finalizeOpts).catch(err => {
       console.error('[employeeSign background]', err.message, err.stack);
-    }
+    });
   });
 });
 
@@ -1963,7 +2126,7 @@ const getSessionSignedPdf = asyncHandler(async (req, res) => {
 
     let session = await TemplateSession.findOne({
       _id:       req.params.sessionId,
-      template:  template._id,
+      $or:       [{ template: template._id }, { templateId: template._id }],
       isDeleted: { $ne: true },
     });
 
@@ -1978,13 +2141,12 @@ const getSessionSignedPdf = asyncHandler(async (req, res) => {
       campaignId: session.campaignId,
     });
 
-    session = await ensureEmployeeSessionPdf(session, templateCtx);
-
-    const buffer = await loadEmployeeSessionPdfBytes(session);
+    const { pdfBuffer } = await buildEmployeeSessionPdf(session, templateCtx);
+    await persistEmployeeSessionPdf(session, pdfBuffer);
 
     const safeName = `${template.title}_${session.recipientName}`
       .replace(/[^a-zA-Z0-9._-]/g, '_');
-    return sendPdf(res, buffer, safeName);
+    return sendPdf(res, pdfBuffer, safeName);
   } catch (err) {
     console.error('[getSessionSignedPdf]', err.message);
     return res.status(502).json({ success: false, message: err.message });
@@ -2007,7 +2169,7 @@ const resendSignedCopy = asyncHandler(async (req, res) => {
 
   let session = await TemplateSession.findOne({
     _id:       req.params.sessionId,
-    template:  template._id,
+    $or:       [{ template: template._id }, { templateId: template._id }],
     isDeleted: { $ne: true },
   });
 
@@ -2023,14 +2185,15 @@ const resendSignedCopy = asyncHandler(async (req, res) => {
   });
 
   try {
-    session = await ensureEmployeeSessionPdf(session, templateCtx);
-    const { sessionDoc } = await buildEmployeeSessionPdf(session, templateCtx);
+    const { pdfBuffer, sessionDoc } = await buildEmployeeSessionPdf(session, templateCtx);
+    await persistEmployeeSessionPdf(session, pdfBuffer);
 
     const ownerUser = await resolveTemplateOwnerUser(templateCtx);
     const result = await deliverEmployeeSignedCopyEmail({
       session,
       templateCtx,
       ownerUser,
+      pdfBuffer,
       sessionDoc,
     });
 
@@ -2248,7 +2411,7 @@ const resendFailedEmails = asyncHandler(async (req, res) => {
   }
 
   const sessions = await TemplateSession.find({
-    template:       template._id,
+    $or:            [{ template: template._id }, { templateId: template._id }],
     emailDelivered: { $ne: true },
     status:         { $in: ['pending', 'viewed', 'expired'] },
     isDeleted:      { $ne: true },

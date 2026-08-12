@@ -313,7 +313,7 @@ async function distributeCampaignToEmployees(campaign, ownerUser, req) {
   const sessions = await TemplateSession.insertMany(sessionDocs);
 
   const { queueEmployeeSessionEmails } = require('./templateController');
-  queueEmployeeSessionEmails({
+  const emailResult = await queueEmployeeSessionEmails({
     sessions,
     template: campaign,
     bossUser: ownerUser,
@@ -327,12 +327,18 @@ async function distributeCampaignToEmployees(campaign, ownerUser, req) {
   campaign.stats.pending = campaign.recipients.length;
   await campaign.save();
 
+  const sent = emailResult.emailsSent ?? 0;
+  const failed = emailResult.emailsFailed ?? 0;
+
   return {
-    phase:        'active',
-    emailsSent:   0,
-    emailsQueued: true,
-    emailsFailed: 0,
-    failedRecipients: [],
+    phase:            'active',
+    emailsSent:       sent,
+    emailsQueued:     emailResult.emailsQueued,
+    emailsFailed:     failed,
+    failedRecipients: emailResult.failedRecipients || [],
+    message:          failed
+      ? `Sent ${sent}/${sessions.length} signing emails. ${failed} failed.`
+      : `Signing links sent to ${sent} employee(s).`,
   };
 }
 
@@ -680,7 +686,7 @@ const approveCampaign = asyncHandler(async (req, res) => {
     const result = await distributeCampaignToEmployees(doc, ownerUser, req);
     return res.json({
       success: true,
-      message: `Approved. All ${result.emailsSent} employee email(s) have been sent.`,
+      message: result.message || `Approved. ${result.emailsSent} employee email(s) sent.`,
       ...result,
     });
   }
@@ -689,7 +695,7 @@ const approveCampaign = asyncHandler(async (req, res) => {
   const result = await distributeTemplateEmployees(doc, ownerUser, req);
   return res.json({
     success: true,
-    message: `Approved. All ${result.emailsSent} employee email(s) have been sent.`,
+    message: result.message || `Approved. ${result.emailsSent} employee email(s) sent.`,
     ...result,
   });
 });
