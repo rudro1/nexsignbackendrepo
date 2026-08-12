@@ -2770,20 +2770,36 @@ function headerTextColor(color) {
   return luminance > 0.62 ? '#0f172a' : '#ffffff';
 }
 
-function normalizeLogoUrl(url) {
-  if (!url || typeof url !== 'string') return '';
+function isValidEmailLogoUrl(url) {
+  if (!url || typeof url !== 'string') return false;
   const trimmed = url.trim();
-  if (trimmed.startsWith('blob:') || trimmed.startsWith('data:')) return '';
-  if (trimmed.startsWith('//')) return emailSafeCloudinaryLogo(`https:${trimmed}`);
-  if (trimmed.startsWith('http://')) return emailSafeCloudinaryLogo(trimmed.replace('http://', 'https://'));
-  if (trimmed.startsWith('https://')) return emailSafeCloudinaryLogo(trimmed);
-  return trimmed;
+  if (!trimmed || trimmed.startsWith('blob:') || trimmed.startsWith('data:')) return false;
+  try {
+    const parsed = new URL(trimmed.startsWith('//') ? `https:${trimmed}` : trimmed);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+function normalizeLogoUrl(url) {
+  if (!isValidEmailLogoUrl(url)) return '';
+  const trimmed = url.trim();
+  const https = trimmed.startsWith('//')
+    ? `https:${trimmed}`
+    : trimmed.startsWith('http://')
+      ? trimmed.replace('http://', 'https://')
+      : trimmed;
+  return emailSafeCloudinaryLogo(https);
 }
 
 /** Prefer stored template/doc logo, fall back to owner profile logo */
 function resolveEmailLogo(data = {}) {
-  const raw = data.companyLogo || data.companyLogoUrl || data.ownerCompanyLogo || '';
-  return normalizeLogoUrl(raw);
+  for (const key of ['companyLogo', 'companyLogoUrl', 'ownerCompanyLogo']) {
+    const normalized = normalizeLogoUrl(data[key]);
+    if (normalized) return normalized;
+  }
+  return '';
 }
 
 /** Cloudinary: force PNG + reasonable width for email client compatibility */

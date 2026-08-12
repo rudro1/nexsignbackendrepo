@@ -343,6 +343,90 @@ function validateFields(fields) {
   return null;
 }
 
+const PARTY_COLORS = [
+  '#3B82F6', '#10B981', '#F59E0B', '#EF4444',
+  '#8B5CF6', '#EC4899', '#06B6D4', '#84CC16',
+];
+
+function requiredPartyCount(doc) {
+  const fromFields = (doc.fields || []).map(f => Number(f.partyIndex ?? 0) + 1);
+  const fromParties = doc.parties?.length || 0;
+  return Math.max(1, fromParties, ...(fromFields.length ? fromFields : [0]));
+}
+
+function cloneFieldsForReuse(sourceFields, parties) {
+  return (sourceFields || []).map(raw => {
+    const f = raw?.toObject ? raw.toObject() : { ...raw };
+    const pi = Number(f.partyIndex) || 0;
+    return {
+      id:              f.id,
+      type:            f.type,
+      partyIndex:      pi,
+      partyEmail:      parties[pi]?.email?.toLowerCase?.().trim() || null,
+      page:            Number(f.page) || 1,
+      x:               Number(f.x),
+      y:               Number(f.y),
+      width:           Number(f.width),
+      height:          Number(f.height),
+      fontSize:        f.fontSize     || 14,
+      fontFamily:      f.fontFamily   || 'Inter',
+      fontWeight:      f.fontWeight   || 'normal',
+      color:           f.color        || '#000000',
+      backgroundColor: f.backgroundColor || 'transparent',
+      label:           f.label        || null,
+      placeholder:     f.placeholder  || null,
+      required:        f.required !== false,
+      value:           null,
+      filledAt:        null,
+    };
+  });
+}
+
+function buildSequentialSigningPayload(doc, party, partyIdx, ownerUser) {
+  return {
+    recipientEmail:       party.email,
+    recipientName:        party.name,
+    recipientDesignation: party.designation,
+    senderName:           ownerUser.full_name || ownerUser.name,
+    senderDesignation:    ownerUser.designation,
+    senderEmail:          ownerUser.email,
+    documentTitle:        doc.title,
+    signingLink:          links.sequentialSign(party.token),
+    companyLogoUrl:       doc.companyLogo,
+    ownerCompanyLogo:     ownerUser.company_logo || '',
+    companyName:          doc.companyName,
+    emailHeaderColor:     doc.emailHeaderColor,
+    partyNumber:          partyIdx + 1,
+    totalParties:         doc.parties.length,
+    message:              doc.message,
+    ccList:               doc.ccList,
+    useCustomEmailBody:   doc.useCustomEmailBody,
+    customEmailBody:      doc.customEmailBody,
+    customEmailSubject:   doc.customEmailSubject,
+  };
+}
+
+function partiesWithAuditFromDoc(doc) {
+  return (doc.parties || []).map(p => ({
+    name:            p.name,
+    email:           p.email,
+    designation:     p.designation,
+    status:          p.status,
+    signedAt:        p.signedAt,
+    localSignedTime: p.localSignedTime,
+    device:          p.device,
+    browser:         p.browser,
+    os:              p.os,
+    city:            p.city,
+    region:          p.region,
+    country:         p.country,
+    postalCode:      p.postalCode,
+    ipAddress:       p.ipAddress,
+    latitude:        p.latitude,
+    longitude:       p.longitude,
+  }));
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ROUTES
 // ═══════════════════════════════════════════════════════════════
@@ -1198,21 +1282,351 @@ router.post('/sign/finalize/:docId', async (req, res) => {
   }
 });
 
+// ── 7c. REUSE SEQUENTIAL DOCUMENT ───────────────────────────────
+router.post('/:id/reuse', auth, async (req, res) => {
+  try {
+    const source = await Document.findOne({
+      _id:        req.params.id,
+      owner:      req.user.id,
+      isTemplate: false,
+    });
+
+    if (!source) {
+      return res.status(404).json({ success: false, message: 'Document not found.' });
+    }
+
+    if (source.status === 'draft') {
+      return res.status(400).json({
+        success: false,
+        message: 'Send this document once before reusing it.',
+      });
+    }
+
+    const {
+      title, parties: partiesRaw, ccList: ccRaw, message,
+      useCustomEmailBody, customEmailBody, customEmailSubject,
+    } = req.body;
+
+    const parsedParties = Array.isArray(partiesRaw) ? partiesRaw : [];
+    if (!parsedParties.length) {
+      return res.status(400).json({
+        success: false, message: 'At least one signer is required.',
+      });
+    }
+
+    const minParties = requiredPartyCount(source);
+    if (parsedParties.length < minParties) {
+      return res.status(400).json({
+        success: false,
+        message: `This document requires at least ${minParties} signer(s) to match the field layout.`,
+      });
+    }
+
+    const emails = parsedParties.map(p => String(p.email || '').trim().toLowerCase());
+    if (emails.some(e => !e)) {
+      return res.status(400).json({
+        success: false, message: 'Every signer must have a name and email.',
+      });
+    }
+    if (new Set(emails).size !== emails.length) {
+      return res.status(400).json({
+        success: false, message: 'Duplicate signer emails are not allowed.',
+      });
+    }
+
+    const parsedCC = Array.isArray(ccRaw) ? ccRaw : (source.ccList || []);
+    const clonedFields = cloneFieldsForReuse(source.fields, parsedParties);
+    if (clonedFields.length > 0) {
+      const fieldErr = validateFields(clonedFields);
+      if (fieldErr) return res.status(400).json({ success: false, message: fieldErr });
+    }
+
+    const firstToken = crypto.randomBytes(32).toString('hex');
+    const newDoc = await Document.create({
+      owner:              req.user.id,
+      title:              title?.trim() || `${source.title} — ${new Date().toLocaleDateString()}`,
+      message:            message ?? source.message ?? '',
+      useCustomEmailBody: useCustomEmailBody ?? source.useCustomEmailBody ?? false,
+      customEmailBody:    customEmailBody ?? source.customEmailBody ?? '',
+      customEmailSubject: customEmailSubject ?? source.customEmailSubject ?? '',
+      companyName:        source.companyName,
+      companyLogo:        source.companyLogo,
+      emailHeaderColor:   source.emailHeaderColor || '#0f172a',
+      fileUrl:            source.fileUrl,
+      fileId:             source.fileId,
+      localPdfPath:       source.localPdfPath,
+      fileName:           source.fileName,
+      fileSize:           source.fileSize,
+      totalPages:         source.totalPages || 1,
+      fields:             clonedFields,
+      ccList:             parsedCC,
+      workflowType:       'sequential',
+      status:             'in_progress',
+      currentPartyIndex:  0,
+      sentAt:             new Date(),
+      sourceTemplateId:   source._id,
+      parties: parsedParties.map((p, i) => ({
+        name:           String(p.name || '').trim(),
+        email:          String(p.email || '').trim().toLowerCase(),
+        designation:    String(p.designation || '').trim() || null,
+        order:          i,
+        color:          p.color || PARTY_COLORS[i % PARTY_COLORS.length],
+        status:         i === 0 ? 'sent' : 'pending',
+        token:          i === 0 ? firstToken : null,
+        emailSentAt:    i === 0 ? new Date() : null,
+        tokenExpiresAt: i === 0 ? new Date(Date.now() + 72 * 60 * 60 * 1000) : null,
+      })),
+    });
+
+    source.usageCount = (source.usageCount || 0) + 1;
+    await source.save();
+
+    safeAuditLog({
+      document_id:    newDoc._id,
+      document_title: newDoc.title,
+      company_name:   newDoc.companyName,
+      action:         'sent',
+      performed_by: {
+        user_id:     req.user._id,
+        name:        req.user.full_name,
+        email:       req.user.email,
+        designation: req.user.designation,
+        role:        'owner',
+      },
+      details: {
+        reused_from:   String(source._id),
+        total_parties: parsedParties.length,
+        total_fields:  clonedFields.length,
+      },
+    });
+
+    emitSocket(req, 'document:created', {
+      documentId: newDoc._id,
+      ownerId:    req.user.id,
+      title:      newDoc.title,
+      status:     newDoc.status,
+    });
+
+    res.status(201).json({
+      success:  true,
+      message:  `New signing request sent to ${newDoc.parties[0].name}.`,
+      document: sanitizeDoc(newDoc),
+    });
+
+    const signingPayload = buildSequentialSigningPayload(
+      newDoc, newDoc.parties[0], 0, req.user,
+    );
+    sendSigningEmail(signingPayload).catch(emailErr => {
+      console.error('[reuse] First email failed:', emailErr.message);
+    });
+
+    parsedCC.forEach(cc =>
+      sendCCEmail({
+        recipientEmail:       cc.email,
+        recipientName:        cc.name,
+        recipientDesignation: cc.designation,
+        senderName:           req.user.full_name,
+        senderDesignation:    req.user.designation,
+        documentTitle:        newDoc.title,
+        companyLogoUrl:       newDoc.companyLogo,
+        ownerCompanyLogo:     req.user.company_logo || '',
+        companyName:          newDoc.companyName,
+        emailHeaderColor:     newDoc.emailHeaderColor,
+      }).catch(e => console.error('[reuse] CC email failed:', e.message)),
+    );
+  } catch (err) {
+    console.error('[POST /documents/:id/reuse]', err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── 7d. RESEND SIGNING EMAIL (current signer) ───────────────────
+router.post('/:id/parties/:partyId/resend', auth, async (req, res) => {
+  try {
+    const doc = await Document.findOne({
+      _id: req.params.id, owner: req.user.id, isTemplate: false,
+    });
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Document not found.' });
+    }
+    if (doc.status !== 'in_progress') {
+      return res.status(400).json({
+        success: false,
+        message: 'Document is not waiting for signatures.',
+      });
+    }
+
+    const partyIdx = doc.parties.findIndex(
+      p => String(p._id) === String(req.params.partyId),
+    );
+    if (partyIdx < 0) {
+      return res.status(404).json({ success: false, message: 'Signer not found.' });
+    }
+
+    const party = doc.parties[partyIdx];
+    if (party.status === 'signed') {
+      return res.status(400).json({
+        success: false, message: 'This signer has already signed.',
+      });
+    }
+    if (partyIdx !== doc.currentPartyIndex) {
+      return res.status(400).json({
+        success: false,
+        message: 'Only the current signer can receive a reminder email.',
+      });
+    }
+
+    if (!party.token) {
+      party.token = crypto.randomBytes(32).toString('hex');
+    }
+    party.status         = 'sent';
+    party.emailSentAt    = new Date();
+    party.tokenExpiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000);
+    await doc.save();
+
+    const ownerUser = await User.findById(req.user.id)
+      .select('full_name name email designation company_logo')
+      .lean();
+
+    const result = await sendSigningEmail(
+      buildSequentialSigningPayload(doc, party, partyIdx, ownerUser || req.user),
+    );
+
+    if (!result?.success) {
+      return res.status(502).json({
+        success: false,
+        message: `Could not deliver email to ${party.email}. ${result?.error || ''}`.trim(),
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `Signing email resent to ${party.email}.`,
+    });
+  } catch (err) {
+    console.error('[POST /documents/:id/parties/:partyId/resend]', err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── 7e. RESEND COMPLETED PDF TO SIGNER ────────────────────────────
+router.post('/:id/parties/:partyId/resend-signed', auth, async (req, res) => {
+  try {
+    const doc = await Document.findOne({
+      _id: req.params.id, owner: req.user.id, isTemplate: false,
+    });
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Document not found.' });
+    }
+    if (doc.status !== 'completed') {
+      return res.status(400).json({
+        success: false, message: 'Document is not completed yet.',
+      });
+    }
+
+    const party = doc.parties.find(p => String(p._id) === String(req.params.partyId));
+    if (!party) {
+      return res.status(404).json({ success: false, message: 'Signer not found.' });
+    }
+    if (party.status !== 'signed') {
+      return res.status(400).json({
+        success: false, message: 'This signer has not signed yet.',
+      });
+    }
+
+    let pdfBuffer;
+    try {
+      pdfBuffer = await getPdfBytes(doc, { preferSigned: true });
+    } catch (fetchErr) {
+      const filledFields = (doc.fields || []).filter(
+        f => f.value && String(f.value).trim(),
+      );
+      if (!filledFields.length) {
+        throw fetchErr;
+      }
+      const merged = await mergeSignaturesIntoPDF(doc, filledFields);
+      try {
+        pdfBuffer = Buffer.from(await appendAuditPage(merged, doc));
+      } catch {
+        pdfBuffer = Buffer.from(merged);
+      }
+    }
+
+    const ownerRecord = await User.findById(doc.owner).select('company_logo').lean();
+    const result = await sendCompletionEmail({
+      recipientEmail:       party.email,
+      recipientName:        party.name,
+      recipientDesignation: party.designation,
+      documentTitle:        doc.title,
+      pdfBuffer,
+      signedPdfUrl:         doc.signedFileUrl || '',
+      companyLogoUrl:       doc.companyLogo,
+      ownerCompanyLogo:     ownerRecord?.company_logo || '',
+      companyName:          doc.companyName,
+      emailHeaderColor:     doc.emailHeaderColor,
+      parties:              partiesWithAuditFromDoc(doc),
+      ccList:               doc.ccList,
+      isCC:                 false,
+    });
+
+    if (!result?.success) {
+      return res.status(502).json({
+        success: false,
+        message: `Could not send signed PDF to ${party.email}. ${result?.error || ''}`.trim(),
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `Signed copy sent to ${party.email}.`,
+    });
+  } catch (err) {
+    console.error('[POST /documents/:id/parties/:partyId/resend-signed]', err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ── 8. GET DOCUMENT PDF (owner preview) ─────────────────────────
 router.get('/:id/pdf', auth, async (req, res) => {
   try {
     const doc = await Document.findOne({
       _id: req.params.id,
       owner: req.user.id,
-    }).select('fileUrl fileId signedFileId title localPdfPath signedFileUrl localSignedPdfPath status')
-      .lean();
+    }).select(
+      'fileUrl fileId signedFileId title localPdfPath signedFileUrl localSignedPdfPath status fields parties companyName',
+    ).lean();
 
     if (!doc) {
       return res.status(404).json({ success: false, message: 'Document not found.' });
     }
 
-    const preferSigned = req.query.signed === '1' && doc.status === 'completed';
-    const buffer = await getPdfBytes(doc, { preferSigned });
+    const wantSigned = req.query.signed === '1' && doc.status === 'completed';
+
+    if (wantSigned && !doc.signedFileUrl && !doc.localSignedPdfPath) {
+      _finalizeDocument(req, doc._id).catch(e =>
+        console.error('[GET /documents/:id/pdf] finalize retry:', e.message),
+      );
+
+      const filledFields = (doc.fields || []).filter(
+        f => f.value && String(f.value).trim(),
+      );
+      if (filledFields.length > 0) {
+        try {
+          const merged = await mergeSignaturesIntoPDF(doc, filledFields);
+          let previewBuffer;
+          try {
+            previewBuffer = Buffer.from(await appendAuditPage(merged, doc));
+          } catch {
+            previewBuffer = Buffer.from(merged);
+          }
+          return sendPdf(res, previewBuffer, doc.title);
+        } catch (genErr) {
+          console.warn('[GET /documents/:id/pdf] On-the-fly signed PDF failed:', genErr.message);
+        }
+      }
+    }
+
+    const buffer = await getPdfBytes(doc, { preferSigned: wantSigned });
     return sendPdf(res, buffer, doc.title);
   } catch (err) {
     console.error('[GET /documents/:id/pdf]', err.message);
@@ -1485,23 +1899,31 @@ async function _finalizeDocument(req, docOrId) {
       signedPdfUrl: uploaded.secure_url,
     });
 
+    emitSocket(req, 'document:updated', {
+      _id:           String(freshDoc._id),
+      status:        'completed',
+      signedFileUrl: uploaded.secure_url,
+      completedAt:   freshDoc.completedAt,
+    });
+
     // ✅ Step 5: Build audit info
     const partiesWithAudit = freshDoc.parties.map(p => ({
-      name:        p.name,
-      email:       p.email,
-      designation: p.designation,
-      status:      p.status,
-      signedAt:    p.signedAt,
-      auditInfo: {
-        device:   p.device        || null,
-        browser:  p.browser       || null,
-        os:       p.os            || null,
-        location: [p.city, p.region, p.country]
-          .filter(Boolean).join(', ') || null,
-        postal:   p.postalCode      || null,
-        time:     p.localSignedTime || null,
-        ip:       p.ipAddress       || null,
-      },
+      name:            p.name,
+      email:           p.email,
+      designation:     p.designation,
+      status:          p.status,
+      signedAt:        p.signedAt,
+      localSignedTime: p.localSignedTime,
+      device:          p.device,
+      browser:         p.browser,
+      os:              p.os,
+      city:            p.city,
+      region:          p.region,
+      country:         p.country,
+      postalCode:      p.postalCode,
+      ipAddress:       p.ipAddress,
+      latitude:        p.latitude,
+      longitude:       p.longitude,
     }));
 
     // ✅ Step 6: Emails — parallel but don't block
