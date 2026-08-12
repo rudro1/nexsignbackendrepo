@@ -93,6 +93,7 @@ app.use(
     contentSecurityPolicy:     false,
     crossOriginEmbedderPolicy: false,
     crossOriginOpenerPolicy:   false,
+    permissionsPolicy:         false,
   }),
 );
 
