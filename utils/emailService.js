@@ -2519,6 +2519,11 @@ const EMAIL_CONFIG = {
       paras.push(
         `If you have any questions regarding this document, please contact ${escapeHtml(d.senderName)} directly.`,
       );
+      if (d.includeReviewPdf) {
+        paras.push(
+          'A copy of the document is <strong>attached to this email</strong> for your review before signing.',
+        );
+      }
       return paras;
     },
     closingLine: d => {
@@ -2559,6 +2564,11 @@ const EMAIL_CONFIG = {
       paras.push(
         `If you have any questions about this document, please contact ${boss}${d.bossDesignation ? ` (${escapeHtml(d.bossDesignation)})` : ''} directly.`,
       );
+      if (d.includeReviewPdf) {
+        paras.push(
+          'A copy of the document is <strong>attached to this email</strong> for your review before signing.',
+        );
+      }
       return paras;
     },
     closingLine: d => {
@@ -2640,7 +2650,23 @@ const EMAIL_CONFIG = {
       `All required parties have signed <strong>${escapeHtml(d.docTitle)}</strong>. A completed copy of the fully executed document is attached to this email for your records.`,
       `Please retain this document in a secure location. It constitutes a legally binding agreement.`,
     ],
-    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
+    showButton:  false,
+    hasPdf:      true,
+  },
+
+  employee_signed_copy: {
+    subject:     d => `Your signed copy: "${d.docTitle}"`,
+    heroIcon:    'check',
+    iconBg:      '#F0FDF4',
+    heroTitle:   () => 'Thank You — Signed Copy Enclosed',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.signerName)},`,
+      `Thank you for signing <strong>${escapeHtml(d.docTitle)}</strong>. Your signature has been securely recorded.`,
+      `A completed copy of the document with your signature and the audit certificate is attached to this email for your records.`,
+      `Please save this copy in a secure location.`,
+    ],
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     showButton:  false,
     hasPdf:      true,
   },
@@ -2768,6 +2794,57 @@ function headerTextColor(color) {
   if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return '#ffffff';
   const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
   return luminance > 0.62 ? '#0f172a' : '#ffffff';
+}
+
+function htmlToPlainText(html) {
+  return String(html || '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#?\w+;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildMailHeaders(data) {
+  const smtpUser = process.env.SMTP_USER || process.env.SMTP_FROM || process.env.EMAIL_USER || 'noreply@localhost';
+  const domain   = String(smtpUser).split('@')[1] || 'nexsign.app';
+  return {
+    'X-Mailer':        'NexSign',
+    Importance:        'normal',
+    'Message-ID':      `<${Date.now()}.${Math.random().toString(36).slice(2)}@${domain}>`,
+    'X-Entity-Ref-ID': String(data.docTitle || data.documentTitle || 'nexsign').slice(0, 80),
+  };
+}
+
+/** Gmail-safe PDF attachment (Buffer + correct MIME headers) */
+function buildPdfAttachment(documentTitle, pdfBuffer, label = 'signed') {
+  if (!pdfBuffer) return null;
+  const buf = Buffer.isBuffer(pdfBuffer) ? pdfBuffer : Buffer.from(pdfBuffer);
+  if (!buf.length) return null;
+  if (buf.length > 24 * 1024 * 1024) {
+    console.warn('[emailService] PDF attachment exceeds 24MB — Gmail may reject');
+  }
+  const safe = String(documentTitle || 'document').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const suffix = label === 'review' ? '_review' : '_signed';
+  return {
+    filename:            `${safe}${suffix}.pdf`,
+    content:             buf,
+    contentType:         'application/pdf',
+    contentDisposition:  'attachment',
+  };
+}
+
+function pdfAttachmentsFromData(data, label = 'signed') {
+  const att = buildPdfAttachment(
+    data.documentTitle || data.docTitle,
+    data.pdfBuffer,
+    label,
+  );
+  return att ? [att] : [];
 }
 
 function isValidEmailLogoUrl(url) {
@@ -3159,7 +3236,7 @@ function composeEmail(type, data, attachments = []) {
     closingHtml,
     buttonText,
     showButton,
-    hasPdf:           config.hasPdf,
+    hasPdf:           config.hasPdf || !!(data.pdfBuffer || attachments?.length),
     actionUrl,
     documentTitle:    data.docTitle || data.documentTitle || 'Document',
     documentSubtitle: docSubtitle,
@@ -3189,16 +3266,23 @@ function buildEmailPreview(type, data) {
 async function sendEmail(type, data, attachments = []) {
   let subject = '';
   let html    = '';
+  let text    = '';
 
   try {
     ({ subject, html } = composeEmail(type, data, attachments));
+    text = htmlToPlainText(html);
+
+    const smtpUser = process.env.SMTP_USER || process.env.SMTP_FROM || process.env.EMAIL_USER || 'noreply@localhost';
+    const fromName   = String(data.companyName || 'NexSign').replace(/"/g, "'").slice(0, 80);
 
     await transporter.sendMail({
-      from:        `"${data.companyName || 'NexSign'} via NexSign" <${process.env.SMTP_USER || process.env.SMTP_FROM || process.env.EMAIL_USER || 'noreply@localhost'}>`,
+      from:        `"${fromName}" <${smtpUser}>`,
       replyTo:     data.senderEmail || data.bossEmail || undefined,
       to:          data.to,
       subject,
       html,
+      text,
+      headers:     buildMailHeaders(data),
       attachments,
     });
     console.log(`[emailService] Sent '${type}' to ${data.to} | Subject: ${subject}`);
@@ -3215,9 +3299,15 @@ async function sendEmail(type, data, attachments = []) {
 
 /** Pass branding through so composeEmail resolveEmailLogo can fall back to owner profile */
 function withEmailBranding(data, extra = {}) {
+  const logo = resolveEmailLogo({
+    companyLogo:      data.companyLogo,
+    companyLogoUrl:   data.companyLogoUrl || data.companyLogo || '',
+    ownerCompanyLogo: data.ownerCompanyLogo || '',
+  });
   return {
     ...extra,
-    companyLogoUrl:     data.companyLogoUrl || data.companyLogo || '',
+    companyLogo:        logo,
+    companyLogoUrl:     logo,
     ownerCompanyLogo:   data.ownerCompanyLogo || '',
     companyName:        data.companyName || 'NexSign',
     emailHeaderColor:   data.emailHeaderColor,
@@ -3225,6 +3315,7 @@ function withEmailBranding(data, extra = {}) {
 }
 
 async function sendSigningEmail(data) {
+  const attachments = pdfAttachmentsFromData(data, 'review');
   return sendEmail('signing_request', withEmailBranding(data, {
     to:                data.recipientEmail,
     signerName:        data.recipientName,
@@ -3239,7 +3330,9 @@ async function sendSigningEmail(data) {
     useCustomEmailBody: data.useCustomEmailBody,
     customEmailBody:    data.customEmailBody,
     customEmailSubject: data.customEmailSubject,
-  }));
+    includeReviewPdf:  attachments.length > 0,
+    pdfBuffer:         data.pdfBuffer,
+  }), attachments);
 }
 
 async function sendBossApprovalEmail(data) {
@@ -3255,6 +3348,7 @@ async function sendBossApprovalEmail(data) {
 }
 
 async function sendEmployeeSigningEmail(data) {
+  const attachments = pdfAttachmentsFromData(data, 'review');
   return sendEmail('employee_signing_request', withEmailBranding(data, {
     to:                  data.employeeEmail || data.to,
     employeeName:        data.employeeName,
@@ -3269,7 +3363,9 @@ async function sendEmployeeSigningEmail(data) {
     useCustomEmailBody:  data.useCustomEmailBody,
     customEmailBody:     data.customEmailBody,
     customEmailSubject:  data.customEmailSubject,
-  }));
+    includeReviewPdf:    attachments.length > 0,
+    pdfBuffer:           data.pdfBuffer,
+  }), attachments);
 }
 
 async function sendCampaignBossEmail(data) {
@@ -3326,15 +3422,36 @@ async function sendDeclinedEmail(data) {
   });
 }
 
-async function sendCompletionEmail(data) {
-  const attachments = [];
-  if (data.pdfBuffer) {
-    attachments.push({
-      filename: `${(data.documentTitle || 'document').replace(/[^a-zA-Z0-9._-]/g, '_')}_signed.pdf`,
-      content:  data.pdfBuffer,
-      contentType: 'application/pdf',
-    });
+async function sendEmployeeSignedCopyEmail(data) {
+  const attachments = pdfAttachmentsFromData(data, 'signed');
+
+  let auditNote = '';
+  if (Array.isArray(data.parties) && data.parties.length) {
+    auditNote = data.parties.map((p, i) => {
+      const loc = [p.city, p.region, p.country, p.postalCode].filter(Boolean).join(', ') || 'N/A';
+      const dev = [p.device, p.browser, p.os].filter(Boolean).join(' / ') || 'N/A';
+      return [
+        `${i + 1}. ${p.name || 'Signer'} (${p.email || ''})`,
+        `   Signed: ${p.localSignedTime || p.signedAt || 'N/A'}`,
+        `   Location: ${loc}`,
+        `   IP: ${p.ipAddress || p.ip || 'N/A'} · Device: ${dev}`,
+        p.latitude && p.longitude ? `   GPS: ${p.latitude}, ${p.longitude}` : '',
+      ].filter(Boolean).join('\n');
+    }).join('\n\n');
+    auditNote += '\n\nA Certificate of Completion (legal audit trail) is included as the final page of the attached PDF.';
   }
+
+  return sendEmail('employee_signed_copy', withEmailBranding(data, {
+    to:            data.recipientEmail,
+    signerName:    data.recipientName,
+    docTitle:      data.documentTitle,
+    customMessage: auditNote,
+    emailHeaderColor: data.emailHeaderColor,
+  }), attachments);
+}
+
+async function sendCompletionEmail(data) {
+  const attachments = pdfAttachmentsFromData(data, 'signed');
 
   let auditNote = '';
   if (Array.isArray(data.parties) && data.parties.length) {
@@ -3433,6 +3550,7 @@ module.exports = {
   sendCampaignApproverEmail,
   sendDeclinedEmail,
   sendCompletionEmail,
+  sendEmployeeSignedCopyEmail,
   sendCCEmail,
   sendFeedbackEmail,
   EMAIL_CONFIG,

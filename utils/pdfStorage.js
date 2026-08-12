@@ -184,6 +184,11 @@ async function getPdfBytes(record, { preferSigned = false } = {}) {
     if (signed) return signed;
   }
 
+  if (record.localSignedPdfPath) {
+    const signedLocal = readLocalPdf(record.localSignedPdfPath);
+    if (signedLocal) return signedLocal;
+  }
+
   if (wantBossSigned && record.localPdfPath) {
     const bossLocal = readLocalPdf(record.localPdfPath);
     if (bossLocal) return bossLocal;

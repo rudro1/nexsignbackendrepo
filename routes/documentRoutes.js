@@ -85,6 +85,8 @@ function handleMulterError(err, req, res, next) {
 // HELPERS
 // ═══════════════════════════════════════════════════════════════
 const { links } = require('../utils/appUrls');
+const { ensurePublicSlug, ensurePartySignCode } = require('../utils/signLinks');
+const { resolveEmailLogo } = require('../utils/emailService');
 
 async function uploadToCloudinary(buffer, options = {}) {
   checkCloudinary();
@@ -382,7 +384,59 @@ function cloneFieldsForReuse(sourceFields, parties) {
   });
 }
 
-function buildSequentialSigningPayload(doc, party, partyIdx, ownerUser) {
+function buildSigningLink(doc, party) {
+  return links.sequentialSign({
+    publicSlug: doc.publicSlug,
+    signCode:   party.signCode,
+    token:      party.token,
+  });
+}
+
+async function resolveDocumentLogo(doc, ownerUser) {
+  const ownerLogo = ownerUser?.company_logo || '';
+  const resolved = resolveEmailLogo({
+    companyLogoUrl:   doc.companyLogo,
+    ownerCompanyLogo: ownerLogo,
+  });
+  if (resolved && !resolveEmailLogo({ companyLogoUrl: doc.companyLogo })) {
+    doc.companyLogo = resolved;
+  }
+  return resolved || doc.companyLogo || ownerLogo || '';
+}
+
+async function loadDocumentReviewPdf(doc) {
+  try {
+    return await getPdfBytes(doc);
+  } catch (e) {
+    console.warn('[loadDocumentReviewPdf]', e.message);
+    return null;
+  }
+}
+
+async function findSigningParty({ token, slug, signCode }) {
+  let doc = null;
+  let idx = -1;
+
+  if (slug && signCode) {
+    doc = await Document.findOne({
+      publicSlug: slug,
+      'parties.signCode': signCode,
+    });
+    if (doc) idx = doc.parties.findIndex(p => p.signCode === signCode);
+  } else if (token) {
+    doc = await Document.findOne({ 'parties.token': token });
+    if (doc) idx = doc.parties.findIndex(p => p.token === token);
+  }
+
+  if (!doc || idx < 0) return { doc: null, party: null, idx: -1 };
+  return { doc, party: doc.parties[idx], idx };
+}
+
+function buildSequentialSigningPayload(doc, party, partyIdx, ownerUser, resolvedLogo) {
+  const logo = resolvedLogo || resolveEmailLogo({
+    companyLogoUrl:   doc.companyLogo,
+    ownerCompanyLogo: ownerUser?.company_logo || '',
+  });
   return {
     recipientEmail:       party.email,
     recipientName:        party.name,
@@ -391,9 +445,10 @@ function buildSequentialSigningPayload(doc, party, partyIdx, ownerUser) {
     senderDesignation:    ownerUser.designation,
     senderEmail:          ownerUser.email,
     documentTitle:        doc.title,
-    signingLink:          links.sequentialSign(party.token),
-    companyLogoUrl:       doc.companyLogo,
-    ownerCompanyLogo:     ownerUser.company_logo || '',
+    signingLink:          buildSigningLink(doc, party),
+    companyLogo:          logo,
+    companyLogoUrl:       logo,
+    ownerCompanyLogo:     ownerUser?.company_logo || '',
     companyName:          doc.companyName,
     emailHeaderColor:     doc.emailHeaderColor,
     partyNumber:          partyIdx + 1,
@@ -754,17 +809,29 @@ router.post(
       doc.status            = 'in_progress';
       doc.currentPartyIndex = 0;
       doc.sentAt            = new Date();
-      doc.parties = parsedParties.map((p, i) => ({
-        name:           p.name?.trim(),
-        email:          p.email?.toLowerCase().trim(),
-        designation:    p.designation?.trim() || null,
-        order:          i,
-        color:          p.color || '#3B82F6',
-        status:         i === 0 ? 'sent'    : 'pending',
-        token:          i === 0 ? firstToken : null,
-        emailSentAt:    i === 0 ? new Date() : null,
-        tokenExpiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000),
-      }));
+      doc.parties = parsedParties.map((p, i) => {
+        const party = {
+          name:           p.name?.trim(),
+          email:          p.email?.toLowerCase().trim(),
+          designation:    p.designation?.trim() || null,
+          order:          i,
+          color:          p.color || '#3B82F6',
+          status:         i === 0 ? 'sent'    : 'pending',
+          token:          i === 0 ? firstToken : null,
+          emailSentAt:    i === 0 ? new Date() : null,
+          tokenExpiresAt: i === 0 ? new Date(Date.now() + 72 * 60 * 60 * 1000) : null,
+        };
+        ensurePartySignCode(party);
+        return party;
+      });
+
+      await ensurePublicSlug(Document, doc, doc.title);
+
+      const ownerRecord = await User.findById(req.user.id)
+        .select('full_name name email designation company_logo')
+        .lean();
+      const ownerUser = ownerRecord || req.user;
+      const resolvedLogo = await resolveDocumentLogo(doc, ownerUser);
 
       await doc.save();
 
@@ -790,26 +857,20 @@ router.post(
       });
 
       const first = doc.parties[0];
+      let reviewPdfBuffer = null;
+      if (req.file?.buffer?.length) {
+        reviewPdfBuffer = Buffer.from(req.file.buffer);
+      } else {
+        try {
+          reviewPdfBuffer = await getPdfBytes(doc);
+        } catch (pdfErr) {
+          console.warn('[upload-and-send] Review PDF for email not loaded:', pdfErr.message);
+        }
+      }
+
       const signingPayload = {
-        recipientEmail:       first.email,
-        recipientName:        first.name,
-        recipientDesignation: first.designation,
-        senderName:           req.user.full_name,
-        senderDesignation:    req.user.designation,
-        senderEmail:          req.user.email,
-        documentTitle:        doc.title,
-        signingLink:          links.sequentialSign(firstToken),
-        companyLogoUrl:       doc.companyLogo,
-        ownerCompanyLogo:     req.user.company_logo || '',
-        companyName:          doc.companyName,
-        emailHeaderColor:     doc.emailHeaderColor,
-        partyNumber:          1,
-        totalParties:         parsedParties.length,
-        message:              doc.message,
-        ccList:               parsedCC,
-        useCustomEmailBody:   doc.useCustomEmailBody,
-        customEmailBody:      doc.customEmailBody,
-        customEmailSubject:   doc.customEmailSubject,
+        ...buildSequentialSigningPayload(doc, first, 0, ownerUser, resolvedLogo),
+        pdfBuffer: reviewPdfBuffer,
       };
 
       emitSocket(req, 'document:created', {
@@ -821,7 +882,13 @@ router.post(
 
       res.json({ success: true, document: sanitizeDoc(doc), emailSent: true });
 
-      sendSigningEmail(signingPayload).catch(emailErr => {
+      sendSigningEmail(signingPayload).then(result => {
+        if (!result?.success) {
+          console.error('[upload-and-send] First email failed:', result?.error);
+        } else {
+          console.log(`[upload-and-send] First email sent to ${first.email}${reviewPdfBuffer ? ' (with PDF)' : ''}`);
+        }
+      }).catch(emailErr => {
         console.error('[upload-and-send] First email failed:', emailErr.message);
       });
 
@@ -833,8 +900,8 @@ router.post(
           documentTitle:        doc.title,
           senderName:           req.user.full_name,
           senderDesignation:    req.user.designation,
-          companyLogoUrl:       doc.companyLogo,
-        ownerCompanyLogo:     req.user.company_logo || '',
+          companyLogoUrl:       resolvedLogo || doc.companyLogo,
+          ownerCompanyLogo:     req.user.company_logo || '',
           companyName:          doc.companyName,
           emailHeaderColor:     doc.emailHeaderColor,
           parties:              parsedParties,
@@ -850,32 +917,41 @@ router.post(
   },
 );
 
-// ── 5. VALIDATE TOKEN ───────────────────────────────────────────
-router.get('/sign/validate/:token', async (req, res) => {
-  try {
-    const { token } = req.params;
+// ── 5. VALIDATE SIGNING LINK (pretty URL + legacy token) ────────
+const SIGN_VALIDATE_SELECT =
+  'title totalPages fields parties companyName companyLogo emailHeaderColor message status useCustomEmailBody customEmailBody customEmailSubject owner publicSlug';
 
-    if (!token || token.length < 10) {
+async function runSignValidate(req, res, ref) {
+  try {
+    let doc = null;
+    let idx = -1;
+
+    if (ref.slug && ref.signCode) {
+      doc = await Document.findOne({
+        publicSlug:       ref.slug,
+        'parties.signCode': ref.signCode,
+      }).select(SIGN_VALIDATE_SELECT);
+      if (doc) idx = doc.parties.findIndex(p => p.signCode === ref.signCode);
+    } else if (ref.token) {
+      if (!ref.token || ref.token.length < 10) {
+        return res.status(400).json({
+          success: false, code: 'INVALID_TOKEN', message: 'Invalid token format.',
+        });
+      }
+      doc = await Document.findOne({ 'parties.token': ref.token })
+        .select(SIGN_VALIDATE_SELECT);
+      if (doc) idx = doc.parties.findIndex(p => p.token === ref.token);
+    } else {
       return res.status(400).json({
-        success: false, code: 'INVALID_TOKEN', message: 'Invalid token format.',
+        success: false, code: 'INVALID_LINK', message: 'Invalid signing link.',
       });
     }
 
-    const doc = await Document.findOne({ 'parties.token': token })
-      .select('title totalPages fields parties companyName companyLogo emailHeaderColor message status useCustomEmailBody customEmailBody customEmailSubject owner');
-    if (!doc) {
+    const party = idx >= 0 ? doc?.parties[idx] : null;
+    if (!doc || !party) {
       return res.status(404).json({
         success: false, code: 'INVALID_LINK',
         message: 'This signing link is invalid or has expired.',
-      });
-    }
-
-    const idx   = doc.parties.findIndex(p => p.token === token);
-    const party = doc.parties[idx];
-
-    if (!party) {
-      return res.status(404).json({
-        success: false, code: 'INVALID_LINK', message: 'Signing party not found.',
       });
     }
 
@@ -908,11 +984,16 @@ router.get('/sign/validate/:token', async (req, res) => {
     try {
       await doc.save();
     } catch (saveErr) {
-      console.error('[GET /sign/validate/:token] save failed:', saveErr.message);
+      console.error('[sign/validate] save failed:', saveErr.message);
     }
 
     const safeDocument = sanitizeDoc(doc, idx);
-    const partyPayload = { ...party.toObject(), index: idx };
+    const partyPayload = {
+      ...party.toObject(),
+      index: idx,
+      publicSlug: doc.publicSlug,
+      signCode:   party.signCode,
+    };
 
     res.json({
       success:  true,
@@ -921,15 +1002,15 @@ router.get('/sign/validate/:token', async (req, res) => {
       geo:      {},
     });
 
-    // Geo enrichment + audit run after response so the signer page loads immediately
+    const geoLookupRef = ref.slug && ref.signCode
+      ? { slug: ref.slug, signCode: ref.signCode }
+      : { token: ref.token };
+
     getGeoLocation(ip).then(async (geo) => {
       if (!geo) return;
       try {
-        const fresh = await Document.findOne({ 'parties.token': token });
-        if (!fresh) return;
-        const pIdx = fresh.parties.findIndex(p => p.token === token);
-        const p = fresh.parties[pIdx];
-        if (!p) return;
+        const { doc: fresh, party: p, idx: pIdx } = await findSigningParty(geoLookupRef);
+        if (!fresh || !p || pIdx < 0) return;
         p.city       = geo.city       || null;
         p.region     = geo.region     || null;
         p.country    = geo.country    || null;
@@ -939,7 +1020,7 @@ router.get('/sign/validate/:token', async (req, res) => {
         p.longitude  = geo.longitude  || null;
         await fresh.save();
       } catch (geoErr) {
-        console.warn('[GET /sign/validate/:token] geo save failed:', geoErr.message);
+        console.warn('[sign/validate] geo save failed:', geoErr.message);
       }
     }).catch(() => {});
 
@@ -972,16 +1053,65 @@ router.get('/sign/validate/:token', async (req, res) => {
       partyName:  party.name,
       device:     device.device,
     });
-
-    return;
-
   } catch (err) {
-    console.error('[GET /sign/validate/:token]', err.message);
+    console.error('[sign/validate]', err.message);
     return res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+router.get('/sign/v/:slug/:signCode', (req, res) =>
+  runSignValidate(req, res, {
+    slug:     req.params.slug,
+    signCode: req.params.signCode,
+  }),
+);
+
+router.get('/sign/validate/:token', (req, res) =>
+  runSignValidate(req, res, { token: req.params.token }),
+);
+
+// ── 6. PDF PROXY ────────────────────────────────────────────────
+async function serveSigningPartyPdf(doc, partyIdx, res) {
+  const embeddedFields = (doc.fields || []).filter(f => {
+    if (!f.value || !String(f.value).trim()) return false;
+    const pi = f.partyIndex ?? 0;
+    if (partyIdx >= 0 && pi >= partyIdx) return false;
+    if (partyIdx >= 0 && doc.parties[pi]?.status !== 'signed') return false;
+    return true;
+  });
+
+  if (embeddedFields.length > 0) {
+    try {
+      const merged = await mergeSignaturesIntoPDF(doc, embeddedFields);
+      return sendPdf(res, Buffer.from(merged), doc.title, { publicAccess: true });
+    } catch (mergeErr) {
+      console.warn('[sign/pdf] Merge prior fields failed:', mergeErr.message);
+    }
+  }
+
+  const buffer = await getPdfBytes(doc);
+  return sendPdf(res, buffer, doc.title, { publicAccess: true });
+}
+
+router.get('/sign/v/:slug/:signCode/pdf', async (req, res) => {
+  try {
+    const doc = await Document.findOne({
+      publicSlug:         req.params.slug,
+      'parties.signCode': req.params.signCode,
+    })
+      .select('fileUrl fileId signedFileId title localPdfPath signedFileUrl localSignedPdfPath fields parties')
+      .lean();
+
+    if (!doc) return res.status(404).send('Not found');
+
+    const partyIdx = doc.parties?.findIndex(p => p.signCode === req.params.signCode) ?? -1;
+    return serveSigningPartyPdf(doc, partyIdx, res);
+  } catch (err) {
+    console.error('[GET /sign/v/:slug/:signCode/pdf]', err.message);
+    return res.status(err.message.includes('not available') ? 404 : 502).send(err.message);
   }
 });
 
-// ── 6. PDF PROXY ────────────────────────────────────────────────
 router.get('/sign/:token/pdf', async (req, res) => {
   try {
     const doc = await Document
@@ -992,25 +1122,7 @@ router.get('/sign/:token/pdf', async (req, res) => {
     if (!doc) return res.status(404).send('Not found');
 
     const partyIdx = doc.parties?.findIndex(p => p.token === req.params.token) ?? -1;
-    const embeddedFields = (doc.fields || []).filter(f => {
-      if (!f.value || !String(f.value).trim()) return false;
-      const pi = f.partyIndex ?? 0;
-      if (partyIdx >= 0 && pi >= partyIdx) return false;
-      if (partyIdx >= 0 && doc.parties[pi]?.status !== 'signed') return false;
-      return true;
-    });
-
-    if (embeddedFields.length > 0) {
-      try {
-        const merged = await mergeSignaturesIntoPDF(doc, embeddedFields);
-        return sendPdf(res, Buffer.from(merged), doc.title, { publicAccess: true });
-      } catch (mergeErr) {
-        console.warn('[GET /sign/:token/pdf] Merge prior fields failed:', mergeErr.message);
-      }
-    }
-
-    const buffer = await getPdfBytes(doc);
-    return sendPdf(res, buffer, doc.title, { publicAccess: true });
+    return serveSigningPartyPdf(doc, partyIdx, res);
   } catch (err) {
     console.error('[GET /sign/:token/pdf]', err.message);
     return res.status(err.message.includes('not available') ? 404 : 502).send(err.message);
@@ -1020,11 +1132,11 @@ router.get('/sign/:token/pdf', async (req, res) => {
 // ── 7. SUBMIT SIGNATURE ─────────────────────────────────────────
 router.post('/sign/submit', async (req, res) => {
   try {
-    const { token, fields, clientTime, latitude, longitude } = req.body;
+    const { token, slug, signCode, fields, clientTime, latitude, longitude } = req.body;
 
-    if (!token || !fields) {
+    if ((!token && (!slug || !signCode)) || !fields) {
       return res.status(400).json({
-        success: false, message: 'Token and fields are required.',
+        success: false, message: 'Signing reference and fields are required.',
       });
     }
 
@@ -1033,16 +1145,13 @@ router.post('/sign/submit', async (req, res) => {
       if (fieldErr) return res.status(400).json({ success: false, message: fieldErr });
     }
 
-    const doc = await Document.findOne({ 'parties.token': token });
+    const { doc, party, idx } = await findSigningParty({ token, slug, signCode });
     if (!doc) {
       return res.status(404).json({
         success: false, code: 'SESSION_EXPIRED',
         message: 'Signing session expired or invalid.',
       });
     }
-
-    const idx   = doc.parties.findIndex(p => p.token === token);
-    const party = doc.parties[idx];
 
     if (!party) {
       return res.status(404).json({
@@ -1127,11 +1236,13 @@ router.post('/sign/submit', async (req, res) => {
 
     if (hasNext) {
       const nextToken = crypto.randomBytes(32).toString('hex');
-      doc.parties[nextIdx].token          = nextToken;
-      doc.parties[nextIdx].status         = 'sent';
-      doc.parties[nextIdx].emailSentAt    = new Date();
-      doc.parties[nextIdx].tokenExpiresAt =
-        new Date(Date.now() + 72 * 60 * 60 * 1000);
+      const nextParty = doc.parties[nextIdx];
+      nextParty.token          = nextToken;
+      nextParty.status         = 'sent';
+      nextParty.emailSentAt    = new Date();
+      nextParty.tokenExpiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000);
+      ensurePartySignCode(nextParty);
+      if (!doc.publicSlug) await ensurePublicSlug(Document, doc, doc.title);
       doc.currentPartyIndex = nextIdx;
 
       await doc.save();
@@ -1167,29 +1278,16 @@ router.post('/sign/submit', async (req, res) => {
         })),
       });
 
-      const nextParty = doc.parties[nextIdx];
-      const ownerUser = await User.findById(doc.owner).select('company_logo').lean();
+      const ownerUser = await User.findById(doc.owner)
+        .select('full_name name email designation company_logo')
+        .lean();
 
-      sendSigningEmail({
-        recipientEmail:       nextParty.email,
-        recipientName:        nextParty.name,
-        recipientDesignation: nextParty.designation,
-        senderName:           party.name,
-        senderDesignation:    party.designation,
-        documentTitle:        doc.title,
-        signingLink:          links.sequentialSign(nextToken),
-        companyLogoUrl:       doc.companyLogo,
-        ownerCompanyLogo:     ownerUser?.company_logo || '',
-        companyName:          doc.companyName,
-        emailHeaderColor:     doc.emailHeaderColor,
-        partyNumber:          nextIdx + 1,
-        totalParties:         doc.parties.length,
-        message:              doc.message,
-        ccList:               doc.ccList,
-        useCustomEmailBody:   doc.useCustomEmailBody,
-        customEmailBody:      doc.customEmailBody,
-        customEmailSubject:   doc.customEmailSubject,
-      }).catch(emailErr => {
+      sendSigningEmail(
+        {
+          ...buildSequentialSigningPayload(doc, nextParty, nextIdx, ownerUser || {}),
+          pdfBuffer: await loadDocumentReviewPdf(doc),
+        },
+      ).catch(emailErr => {
         console.error('[sign/submit] Next signer email failed:', emailErr.message);
       });
 
@@ -1365,18 +1463,31 @@ router.post('/:id/reuse', auth, async (req, res) => {
       currentPartyIndex:  0,
       sentAt:             new Date(),
       sourceTemplateId:   source._id,
-      parties: parsedParties.map((p, i) => ({
-        name:           String(p.name || '').trim(),
-        email:          String(p.email || '').trim().toLowerCase(),
-        designation:    String(p.designation || '').trim() || null,
-        order:          i,
-        color:          p.color || PARTY_COLORS[i % PARTY_COLORS.length],
-        status:         i === 0 ? 'sent' : 'pending',
-        token:          i === 0 ? firstToken : null,
-        emailSentAt:    i === 0 ? new Date() : null,
-        tokenExpiresAt: i === 0 ? new Date(Date.now() + 72 * 60 * 60 * 1000) : null,
-      })),
+      parties: parsedParties.map((p, i) => {
+        const party = {
+          name:           String(p.name || '').trim(),
+          email:          String(p.email || '').trim().toLowerCase(),
+          designation:    String(p.designation || '').trim() || null,
+          order:          i,
+          color:          p.color || PARTY_COLORS[i % PARTY_COLORS.length],
+          status:         i === 0 ? 'sent' : 'pending',
+          token:          i === 0 ? firstToken : null,
+          emailSentAt:    i === 0 ? new Date() : null,
+          tokenExpiresAt: i === 0 ? new Date(Date.now() + 72 * 60 * 60 * 1000) : null,
+        };
+        ensurePartySignCode(party);
+        return party;
+      }),
     });
+
+    await ensurePublicSlug(Document, newDoc, newDoc.title);
+
+    const ownerRecord = await User.findById(req.user.id)
+      .select('full_name name email designation company_logo')
+      .lean();
+    const ownerUser = ownerRecord || req.user;
+    const resolvedLogo = await resolveDocumentLogo(newDoc, ownerUser);
+    await newDoc.save();
 
     source.usageCount = (source.usageCount || 0) + 1;
     await source.save();
@@ -1413,9 +1524,12 @@ router.post('/:id/reuse', auth, async (req, res) => {
       document: sanitizeDoc(newDoc),
     });
 
-    const signingPayload = buildSequentialSigningPayload(
-      newDoc, newDoc.parties[0], 0, req.user,
-    );
+    const signingPayload = {
+      ...buildSequentialSigningPayload(
+        newDoc, newDoc.parties[0], 0, ownerUser, resolvedLogo,
+      ),
+      pdfBuffer: await loadDocumentReviewPdf(newDoc),
+    };
     sendSigningEmail(signingPayload).catch(emailErr => {
       console.error('[reuse] First email failed:', emailErr.message);
     });
@@ -1479,18 +1593,22 @@ router.post('/:id/parties/:partyId/resend', auth, async (req, res) => {
     if (!party.token) {
       party.token = crypto.randomBytes(32).toString('hex');
     }
+    ensurePartySignCode(party);
+    if (!doc.publicSlug) await ensurePublicSlug(Document, doc, doc.title);
     party.status         = 'sent';
     party.emailSentAt    = new Date();
     party.tokenExpiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000);
-    await doc.save();
 
     const ownerUser = await User.findById(req.user.id)
       .select('full_name name email designation company_logo')
       .lean();
+    const resolvedLogo = await resolveDocumentLogo(doc, ownerUser || req.user);
+    await doc.save();
 
-    const result = await sendSigningEmail(
-      buildSequentialSigningPayload(doc, party, partyIdx, ownerUser || req.user),
-    );
+    const result = await sendSigningEmail({
+      ...buildSequentialSigningPayload(doc, party, partyIdx, ownerUser || req.user, resolvedLogo),
+      pdfBuffer: await loadDocumentReviewPdf(doc),
+    });
 
     if (!result?.success) {
       return res.status(502).json({

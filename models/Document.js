@@ -26,6 +26,7 @@ const partySchema = new mongoose.Schema(
 
     // ✅ select: false সরানো হয়েছে — এটাই মূল bug ছিল
     token:          { type: String, index: true, sparse: true },
+    signCode:       { type: String, index: true, sparse: true },
     tokenExpiresAt: { type: Date, default: null },
 
     emailSentAt:    { type: Date, default: null },
@@ -100,6 +101,9 @@ const documentSchema = new mongoose.Schema(
     companyName: { type: String, trim: true, default: '' },
     companyLogo: { type: String, default: null },
     emailHeaderColor: { type: String, default: '#0f172a' },
+
+    /** URL-safe slug for pretty signing links, e.g. unpaid-leave-application */
+    publicSlug: { type: String, default: null, index: true, sparse: true },
 
     fileUrl:  { type: String, required: [true, 'File URL is required'] },
     fileId:   { type: String, required: [true, 'File ID is required'] },

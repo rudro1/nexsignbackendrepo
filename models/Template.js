@@ -112,6 +112,7 @@ const TemplateSchema = new mongoose.Schema({
   companyName: { type: String, default: '' },
   companyLogo: { type: String, default: '' },
   emailHeaderColor: { type: String, default: '#0f172a' },
+  publicSlug: { type: String, default: null, index: true, sparse: true },
   message:     { type: String, default: '' },
 
   // Optional sequential approvers before employee emails (CEO → HR → …)

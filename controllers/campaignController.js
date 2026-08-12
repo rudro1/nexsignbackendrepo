@@ -15,6 +15,7 @@ try { emailService = require('../utils/emailService'); } catch { /* optional */ 
 
 const { getPdfBytes, sendPdf } = require('../utils/pdfStorage');
 const { links } = require('../utils/appUrls');
+const { ensurePublicSlug, generateSignCode } = require('../utils/signLinks');
 
 const {
   sendEmployeeSigningEmail,
@@ -76,17 +77,52 @@ async function dispatchEmployeeEmailForCampaign({ session, campaign, bossUser })
   const customBody = campaign.customEmailBody || sc.customEmailBody || '';
   const customSubject = campaign.customEmailSubject || sc.customEmailSubject || '';
 
+  if (!session.signCode) {
+    session.signCode = generateSignCode();
+    await session.save();
+  }
+
+  let slug = null;
+  if (campaign.sourceTemplateId) {
+    const tpl = await Template.findById(campaign.sourceTemplateId).select('publicSlug title');
+    if (tpl) {
+      if (!tpl.publicSlug) {
+        await ensurePublicSlug(Template, tpl, tpl.title);
+        await tpl.save();
+      }
+      slug = tpl.publicSlug;
+    }
+  }
+
+  const logo = resolveCampaignLogo(campaign, bossUser);
+
+  let reviewPdfBuffer = null;
+  try {
+    reviewPdfBuffer = await getPdfBytes({
+      fileUrl:            campaign.bossSignedFileUrl || campaign.fileUrl,
+      filePublicId:       campaign.bossSignedFilePublicId || campaign.filePublicId,
+      localPdfPath:       campaign.localBossSignedPdfPath || campaign.localPdfPath,
+      localBossSignedPdfPath: campaign.localBossSignedPdfPath,
+      bossSignedFileUrl:  campaign.bossSignedFileUrl,
+    }, { preferSigned: true });
+  } catch (e) {
+    console.warn('[dispatchEmployeeEmailForCampaign] Review PDF not loaded:', e.message);
+  }
+
   const payload = {
     employeeEmail:       session.recipientEmail,
     employeeName:        session.recipientName,
     employeeDesignation: session.recipientDesignation || '',
     documentTitle:       campaign.title,
-    signingLink:         links.templateSign(session.token),
+    signingLink:         slug && session.signCode
+      ? links.templateSign({ publicSlug: slug, signCode: session.signCode })
+      : links.templateSign(session.token),
     bossName:            campaign.boss?.name || bossUser.full_name || 'Authoriser',
     bossDesignation:     campaign.boss?.designation || '',
     bossEmail:           campaign.boss?.email || bossUser.email,
     companyName:         campaign.companyName || '',
-    companyLogoUrl:      resolveCampaignLogo(campaign, bossUser),
+    companyLogoUrl:      logo,
+    companyLogo:         logo,
     ownerCompanyLogo:    bossUser?.company_logo || '',
     emailHeaderColor:    campaign.emailHeaderColor || '#0f172a',
     message:             campaign.message || '',
@@ -94,6 +130,7 @@ async function dispatchEmployeeEmailForCampaign({ session, campaign, bossUser })
     useCustomEmailBody:  useCustom,
     customEmailBody:     customBody,
     customEmailSubject:  customSubject,
+    pdfBuffer:           reviewPdfBuffer,
   };
 
   let result = await sendEmployeeSigningEmail?.(payload);
@@ -264,6 +301,7 @@ async function distributeCampaignToEmployees(campaign, ownerUser, req) {
     recipientEmail:       r.email,
     recipientDesignation: r.designation || '',
     token:                generateToken(),
+    signCode:             generateSignCode(),
     status:               'pending',
     expiresAt,
     sentAt:               new Date(),

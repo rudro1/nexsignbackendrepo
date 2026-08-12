@@ -115,8 +115,28 @@ function sanitizeFrontendLink(url) {
 }
 
 const links = {
-  sequentialSign:         (token) => frontendPath(`/sign/${encodeToken(token)}`),
-  templateSign:           (token) => frontendPath(`/template-sign/${encodeToken(token)}`),
+  sequentialSign: (tokenOrOpts) => {
+    if (tokenOrOpts && typeof tokenOrOpts === 'object') {
+      const { publicSlug, signCode, token } = tokenOrOpts;
+      if (publicSlug && signCode) {
+        return frontendPath(`/sign/${encodeURIComponent(publicSlug)}/${encodeURIComponent(signCode)}`);
+      }
+      if (token) return frontendPath(`/sign/${encodeToken(token)}`);
+      return frontendPath('/sign/preview-token');
+    }
+    return frontendPath(`/sign/${encodeToken(tokenOrOpts)}`);
+  },
+  templateSign: (tokenOrOpts) => {
+    if (tokenOrOpts && typeof tokenOrOpts === 'object') {
+      const { publicSlug, signCode, token } = tokenOrOpts;
+      if (publicSlug && signCode) {
+        return frontendPath(`/template-sign/${encodeURIComponent(publicSlug)}/${encodeURIComponent(signCode)}`);
+      }
+      if (token) return frontendPath(`/template-sign/${encodeToken(token)}`);
+      return frontendPath('/template-sign/preview-token');
+    }
+    return frontendPath(`/template-sign/${encodeToken(tokenOrOpts)}`);
+  },
   bossSign:               (token) => frontendPath(`/template-campaign/boss/${encodeToken(token)}`),
   approverReview:       (token) => frontendPath(`/template-campaign/approve/${encodeToken(token)}`),
   sequentialSignPreview:  () => frontendPath('/sign/preview-token'),

@@ -107,6 +107,12 @@ const TemplateSessionSchema = new mongoose.Schema({
     index:   true,
     sparse:  true, // sparse — null values skip uniqueness check
   },
+  signCode: {
+    type:   String,
+    default: null,
+    index:  true,
+    sparse: true,
+  },
 
   // ── Status ────────────────────────────────────────
   status: {

@@ -69,15 +69,14 @@ router.post  ('/:id/distribute', auth, async (req, res) => {
   });
 });
 
-// ── Public signing routes (token-based, no auth header) ──────────────────────
-// FIX #2: paths now match frontend apiClient.js exactly:
-//   validateEmployeeToken → GET  /templates/sign/validate/:token
-//   submitEmployeeSignature → POST /templates/sign/submit/:token
-//   declineEmployee         → POST /templates/sign/decline/:token
-//   getPdfProxyUrl          → GET  /templates/sign/:token/pdf
-router.get   ('/sign/validate/:token',          ctrl.getSessionByToken);
-router.post  ('/sign/submit/:token',            ctrl.employeeSign);
-router.post  ('/sign/decline/:token',           ctrl.employeeDecline);
-router.get   ('/sign/:token/pdf',               ctrl.getTemplatePdf);
+// ── Public signing routes (pretty URL + legacy token) ──────────────────────
+router.get   ('/sign/v/:slug/:signCode',          ctrl.getSessionByPrettyLink);
+router.get   ('/sign/v/:slug/:signCode/pdf',     ctrl.getTemplatePdf);
+router.post  ('/sign/v/:slug/:signCode/submit',  ctrl.employeeSign);
+router.post  ('/sign/v/:slug/:signCode/decline', ctrl.employeeDecline);
+router.get   ('/sign/validate/:token',            ctrl.getSessionByToken);
+router.post  ('/sign/submit/:token',              ctrl.employeeSign);
+router.post  ('/sign/decline/:token',             ctrl.employeeDecline);
+router.get   ('/sign/:token/pdf',                 ctrl.getTemplatePdf);
 
 module.exports = router;

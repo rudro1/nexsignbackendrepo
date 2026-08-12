@@ -27,6 +27,7 @@ try {
 
 const { getPdfBytes, sendPdf, savePdfBuffer } = require('../utils/pdfStorage');
 const { links } = require('../utils/appUrls');
+const { ensurePublicSlug, generateSignCode } = require('../utils/signLinks');
 const {
   resolveSigningLocation,
   toAuditLocation,
@@ -38,6 +39,7 @@ const {
   sendEmployeeSigningEmail,
   sendEmailDeliveryFailureNotice,
   sendCompletionEmail,
+  sendEmployeeSignedCopyEmail,
   sendCCEmail,
   sendDeclinedEmail,
   sendCampaignBossEmail,
@@ -48,6 +50,66 @@ const {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const EMAIL_BATCH_DELAY_MS = 800;
+
+async function findTemplateSession({ token, slug, signCode }) {
+  if (slug && signCode) {
+    const tpl = await Template.findOne({ publicSlug: slug }).select('_id');
+    if (!tpl) return null;
+    return TemplateSession.findOne({
+      signCode,
+      $or: [{ template: tpl._id }, { templateId: tpl._id }],
+      isDeleted: { $ne: true },
+    }).populate('template').populate('templateId');
+  }
+  if (token) return TemplateSession.findByToken(token);
+  return null;
+}
+
+async function ensureTemplatePublicSlug(templateDoc) {
+  if (!templateDoc) return null;
+  if (templateDoc.publicSlug) return templateDoc.publicSlug;
+  await ensurePublicSlug(Template, templateDoc, templateDoc.title);
+  await templateDoc.save();
+  return templateDoc.publicSlug;
+}
+
+async function resolveTemplateSlugForSession(session, contextDoc) {
+  if (contextDoc?.publicSlug) return contextDoc.publicSlug;
+  const templateId = session?.templateId || session?.template?._id || session?.template
+    || contextDoc?.sourceTemplateId || contextDoc?._id;
+  if (!templateId) return null;
+  const tpl = await Template.findById(templateId).select('publicSlug title');
+  if (!tpl) return null;
+  return ensureTemplatePublicSlug(tpl);
+}
+
+function buildTemplateSigningLink(slug, session) {
+  if (slug && session?.signCode) {
+    return links.templateSign({ publicSlug: slug, signCode: session.signCode });
+  }
+  return links.templateSign(session?.token);
+}
+
+function newEmployeeSessionDoc(recipient, templateId, expiresAt, extra = {}) {
+  return {
+    template:             templateId,
+    templateId,
+    recipientName:        recipient.name,
+    recipientEmail:       recipient.email,
+    recipientDesignation: recipient.designation || '',
+    token:                generateToken(),
+    signCode:             generateSignCode(),
+    status:               'pending',
+    expiresAt,
+    sentAt:               new Date(),
+    auditLog: [{
+      action:    'link_sent',
+      timestamp: new Date(),
+      note:      'Session created — sending email',
+    }],
+    ...extra,
+  };
+}
 
 /** Send signing emails in background with delay (avoids SMTP rate limits + Vercel timeout) */
 function queueEmployeeSessionEmails({
@@ -142,17 +204,32 @@ async function dispatchEmployeeEmail({ session, template, bossUser }) {
   const customBody = template.customEmailBody || sc.customEmailBody || '';
   const customSubject = template.customEmailSubject || sc.customEmailSubject || '';
 
+  if (!session.signCode) {
+    session.signCode = generateSignCode();
+    await session.save();
+  }
+  const slug = await resolveTemplateSlugForSession(session, template);
+  const logo = resolveTemplateLogo(template, bossUser);
+
+  let reviewPdfBuffer = null;
+  try {
+    reviewPdfBuffer = await getPdfBytes(buildBossPdfSource(template), { preferSigned: true });
+  } catch (e) {
+    console.warn('[dispatchEmployeeEmail] Review PDF not loaded:', e.message);
+  }
+
   const payload = {
     employeeEmail:       session.recipientEmail,
     employeeName:        session.recipientName,
     employeeDesignation: session.recipientDesignation || '',
     documentTitle:       template.title,
-    signingLink:         links.templateSign(session.token),
+    signingLink:         buildTemplateSigningLink(slug, session),
     bossName:            bossUser.full_name || bossUser.name || 'Your Manager',
     bossDesignation:     bossUser.designation || '',
     bossEmail:           bossUser.email,
     companyName:         template.companyName || '',
-    companyLogoUrl:      resolveTemplateLogo(template, bossUser),
+    companyLogoUrl:      logo,
+    companyLogo:         logo,
     ownerCompanyLogo:    bossUser?.company_logo || '',
     emailHeaderColor:    template.emailHeaderColor || '#0f172a',
     message:             template.message || sc.emailMessage || '',
@@ -160,6 +237,7 @@ async function dispatchEmployeeEmail({ session, template, bossUser }) {
     useCustomEmailBody:  useCustom,
     customEmailBody:     customBody,
     customEmailSubject:  customSubject,
+    pdfBuffer:           reviewPdfBuffer,
   };
 
   let result = await sendEmployeeSigningEmail?.(payload);
@@ -224,21 +302,11 @@ async function distributeTemplateEmployees(template, bossUser, req) {
   const expiryDays = template.signingConfig?.expiryDays || 30;
   const expiresAt  = new Date(Date.now() + expiryDays * 86_400_000);
 
-  const sessionDocs = template.recipients.map(r => ({
-    template:             template._id,
-    recipientName:        r.name,
-    recipientEmail:       r.email,
-    recipientDesignation: r.designation || '',
-    token:                generateToken(),
-    status:               'pending',
-    expiresAt,
-    sentAt:               new Date(),
-    auditLog: [{
-      action:    'link_sent',
-      timestamp: new Date(),
-      note:      'Session created — sending email',
-    }],
-  }));
+  await ensureTemplatePublicSlug(template);
+
+  const sessionDocs = template.recipients.map(r =>
+    newEmployeeSessionDoc(r, template._id, expiresAt),
+  );
 
   const sessions = await TemplateSession.insertMany(sessionDocs);
 
@@ -781,21 +849,11 @@ async function advanceTemplateAfterBossSign(template, bossUser, req, auditMeta =
   const expiryDays = template.signingConfig?.expiryDays || 30;
   const expiresAt  = new Date(Date.now() + expiryDays * 86_400_000);
 
-  const sessionDocs = template.recipients.map(r => ({
-    template:             template._id,
-    recipientName:        r.name,
-    recipientEmail:       r.email,
-    recipientDesignation: r.designation || '',
-    token:                generateToken(),
-    status:               'pending',
-    expiresAt,
-    sentAt:               new Date(),
-    auditLog: [{
-      action:    'link_sent',
-      timestamp: new Date(),
-      note:      'Session created — sending email',
-    }],
-  }));
+  await ensureTemplatePublicSlug(template);
+
+  const sessionDocs = template.recipients.map(r =>
+    newEmployeeSessionDoc(r, template._id, expiresAt),
+  );
 
   const sessions = await TemplateSession.insertMany(sessionDocs);
 
@@ -1175,12 +1233,80 @@ async function resolveSessionTemplateContext(session) {
         bossSignature:     campaign.bossSignature,
         ccList:            campaign.ccList,
         signingConfig:     campaign.signingConfig,
+        owner:             campaign.owner || templateObj.owner || templateObj.createdBy,
         _campaignId:       String(campaign._id),
       };
     }
   }
 
   return templateObj;
+}
+
+/** Load stored employee signed PDF bytes (local copy preferred) */
+async function loadEmployeeSessionPdfBytes(session) {
+  return getPdfBytes({
+    fileUrl:            session.signedFileUrl,
+    filePublicId:       session.signedFilePublicId,
+    signedFileUrl:      session.signedFileUrl,
+    localSignedPdfPath: session.localSignedPdfPath,
+  }, { preferSigned: true });
+}
+
+async function resolveTemplateOwnerUser(template) {
+  const ownerId = template?.owner || template?.createdBy;
+  if (!ownerId) return null;
+  return User.findById(ownerId).select('full_name email company_logo designation').lean();
+}
+
+/** Send signed PDF copy to employee after they sign (or on manual resend) */
+async function deliverEmployeeSignedCopyEmail({
+  session,
+  templateCtx,
+  ownerUser,
+  pdfBuffer = null,
+  sessionDoc = null,
+}) {
+  let buffer = pdfBuffer;
+  if (!buffer) {
+    try {
+      buffer = await loadEmployeeSessionPdfBytes(session);
+    } catch (e) {
+      console.error('[deliverEmployeeSignedCopyEmail] PDF load failed:', e.message);
+    }
+  }
+
+  if (!buffer) {
+    console.error(
+      `[deliverEmployeeSignedCopyEmail] No PDF for ${session.recipientEmail} — email skipped`,
+    );
+    return { success: false, error: 'No signed PDF available' };
+  }
+
+  const logo = resolveTemplateLogo(templateCtx, ownerUser);
+  const result = await sendEmployeeSignedCopyEmail?.({
+    recipientEmail:       session.recipientEmail,
+    recipientName:        session.recipientName,
+    recipientDesignation: session.recipientDesignation || '',
+    documentTitle:        templateCtx.title,
+    pdfBuffer:            buffer,
+    companyName:          templateCtx.companyName || '',
+    companyLogoUrl:       logo,
+    companyLogo:          logo,
+    ownerCompanyLogo:     ownerUser?.company_logo || '',
+    emailHeaderColor:     templateCtx.emailHeaderColor || '#0f172a',
+    parties:              sessionDoc?.parties || [],
+  });
+
+  if (!result?.success) {
+    console.error(
+      `[deliverEmployeeSignedCopyEmail] Failed for ${session.recipientEmail}:`,
+      result?.error || 'unknown',
+    );
+  } else {
+    console.log(`[deliverEmployeeSignedCopyEmail] Sent to ${session.recipientEmail}`);
+  }
+
+  return result || { success: false, error: 'Email service unavailable' };
 }
 
 /** Boss-signed PDF source record for employee PDF generation */
@@ -1230,9 +1356,7 @@ async function buildEmployeeSessionPdf(session, template, { signatureDataUrl = n
 
   const fieldsWithValues = buildTemplateFieldsWithValues(template, session, { signatureDataUrl });
 
-  const ownerUser = template.owner
-    ? await User.findById(template.owner).select('full_name email designation').lean()
-    : null;
+  const ownerUser = await resolveTemplateOwnerUser(template);
 
   const geo        = session.signingMeta?.location || {};
   const deviceInfo = session.signingMeta?.deviceInfo || {};
@@ -1337,19 +1461,18 @@ async function ensureEmployeeSessionPdf(session, template) {
 }
 
 // ════════════════════════════════════════════════════
-// 8. VALIDATE SESSION TOKEN (public)
-// GET /api/templates/sign/validate/:token
+// 8. VALIDATE SESSION (pretty URL + legacy token)
 // ════════════════════════════════════════════════════
-const getSessionByToken = asyncHandler(async (req, res) => {
-  const session = await TemplateSession.findByToken(req.params.token);
+async function runTemplateSessionValidate(req, res, ref) {
+  const session = await findTemplateSession(ref);
 
-  if (!session)
+  if (!session) {
     return res.status(404).json({
       success: false, code: 'INVALID_LINK',
       message: 'Invalid or expired signing link.',
     });
+  }
 
-  // Expiry check
   if (new Date() > session.expiresAt) {
     if (!['expired', 'signed', 'declined'].includes(session.status)) {
       await session.markExpired();
@@ -1360,19 +1483,20 @@ const getSessionByToken = asyncHandler(async (req, res) => {
     });
   }
 
-  if (session.status === 'signed')
+  if (session.status === 'signed') {
     return res.status(410).json({
       success: false, code: 'ALREADY_SIGNED',
       message: 'You have already signed this document.',
     });
+  }
 
-  if (session.status === 'declined')
+  if (session.status === 'declined') {
     return res.status(410).json({
       success: false, code: 'ALREADY_DECLINED',
       message: 'You have already declined this document.',
     });
+  }
 
-  // Mark viewed
   const ip         = getIP(req);
   const ua         = req.headers['user-agent'] || '';
   const geo        = await getGeoInfo(ip);
@@ -1386,8 +1510,8 @@ const getSessionByToken = asyncHandler(async (req, res) => {
     localTime:  new Date().toUTCString(),
   });
 
-  // Return safe data
   const templateObj = await resolveSessionTemplateContext(session);
+  const publicSlug = ref.slug || await resolveTemplateSlugForSession(session, templateObj);
 
   return res.json({
     success: true,
@@ -1399,23 +1523,34 @@ const getSessionByToken = asyncHandler(async (req, res) => {
       status:               session.status,
       expiresAt:            session.expiresAt,
       viewedAt:             session.viewedAt,
+      publicSlug,
+      signCode:             session.signCode,
     },
     template: {
-      _id:          String(templateObj._id),
-      title:        templateObj.title,
-      description:  templateObj.description,
-      companyName:  templateObj.companyName || '',
-      companyLogo:  templateObj.companyLogo || '',
-      message:      templateObj.message     || '',
-      // ✅ Use boss-signed PDF — employees see PDF with boss signature already
-      fileUrl:      templateObj.bossSignedFileUrl || templateObj.fileUrl,
-      // ✅ Only employee fields
-      fields:       (templateObj.fields || []).filter(f => f.assignedTo === 'employee'),
-      totalPages:   templateObj.totalPages   || 1,
+      _id:           String(templateObj._id),
+      title:         templateObj.title,
+      description:   templateObj.description,
+      companyName:   templateObj.companyName || '',
+      companyLogo:   templateObj.companyLogo || '',
+      message:       templateObj.message     || '',
+      fields:        (templateObj.fields || []).filter(f => f.assignedTo === 'employee'),
+      totalPages:    templateObj.totalPages   || 1,
       signingConfig: templateObj.signingConfig || {},
+      publicSlug,
     },
   });
-});
+}
+
+const getSessionByToken = asyncHandler(async (req, res) =>
+  runTemplateSessionValidate(req, res, { token: req.params.token }),
+);
+
+const getSessionByPrettyLink = asyncHandler(async (req, res) =>
+  runTemplateSessionValidate(req, res, {
+    slug:     req.params.slug,
+    signCode: req.params.signCode,
+  }),
+);
 
 // ════════════════════════════════════════════════════
 // 9. EMPLOYEE SIGN (public)
@@ -1431,7 +1566,11 @@ const employeeSign = asyncHandler(async (req, res) => {
     latitude, longitude, clientTime, auditMeta,
   } = req.body;
 
-  const session = await TemplateSession.findByToken(req.params.token);
+  const ref = req.params.slug
+    ? { slug: req.params.slug, signCode: req.params.signCode }
+    : { token: req.params.token };
+
+  const session = await findTemplateSession(ref);
 
   if (!session)
     return res.status(404).json({
@@ -1554,19 +1693,35 @@ const employeeSign = asyncHandler(async (req, res) => {
         },
       });
 
+      const freshSession = await TemplateSession.findById(session._id);
+      const activeSession = freshSession || session;
+
       // ── Step 3–5: Generate & store signed PDF ───────
       let signedFileUrl = null;
       let pdfBuffer     = null;
       let sessionDoc    = null;
 
       try {
-        const built = await buildEmployeeSessionPdf(session, template, { signatureDataUrl });
+        const built = await buildEmployeeSessionPdf(
+          activeSession, template, { signatureDataUrl },
+        );
         pdfBuffer  = built.pdfBuffer;
         sessionDoc = built.sessionDoc;
-        await persistEmployeeSessionPdf(session, pdfBuffer);
-        signedFileUrl = session.signedFileUrl;
+        await persistEmployeeSessionPdf(activeSession, pdfBuffer);
+        signedFileUrl = activeSession.signedFileUrl;
       } catch (e) {
         console.error('[employeeSign] PDF generation failed:', e.message);
+        try {
+          await ensureEmployeeSessionPdf(activeSession, template);
+          pdfBuffer = await loadEmployeeSessionPdfBytes(activeSession);
+          const rebuilt = await buildEmployeeSessionPdf(
+            activeSession, template, { signatureDataUrl },
+          );
+          sessionDoc = rebuilt.sessionDoc;
+          signedFileUrl = activeSession.signedFileUrl;
+        } catch (retryErr) {
+          console.error('[employeeSign] PDF retry failed:', retryErr.message);
+        }
       }
 
       // ── Step 6: Update template stats ──────────────
@@ -1581,54 +1736,37 @@ const employeeSign = asyncHandler(async (req, res) => {
         freshTemplate = await Template.findById(template._id);
       }
 
-      const owner = template.owner
-        ? await User.findById(template.owner).select('full_name email company_logo').lean()
-        : null;
+      const owner = await resolveTemplateOwnerUser(template);
 
-      // Prefer in-memory PDF; fall back to stored copy for email attachment
-      let emailPdfBuffer = pdfBuffer;
-      if (!emailPdfBuffer) {
-        try {
-          emailPdfBuffer = await getPdfBytes({
-            fileUrl:      session.signedFileUrl,
-            filePublicId: session.signedFilePublicId,
-            localPdfPath: session.localSignedPdfPath,
-          });
-        } catch (e) {
-          console.error('[employeeSign] Could not load stored PDF for email:', e.message);
-        }
-      }
-
-      const signedPdfUrlForEmail = signedFileUrl || session.signedFileUrl || '';
+      const signedPdfUrlForEmail = signedFileUrl || activeSession.signedFileUrl || '';
       const partiesForEmail      = sessionDoc?.parties || [];
 
-      // ── Step 7: Completion email to employee ───────
+      // ── Step 7: Signed copy email to employee ───────
       try {
-        if (emailPdfBuffer || signedPdfUrlForEmail) {
-          await sendCompletionEmail?.({
-            recipientEmail:       session.recipientEmail,
-            recipientName:        session.recipientName,
-            recipientDesignation: session.recipientDesignation || '',
-            documentTitle:        template.title,
-            pdfBuffer:            emailPdfBuffer || null,
-            signedPdfUrl:         signedPdfUrlForEmail || template.bossSignedFileUrl || '',
-            companyName:          template.companyName || '',
-            companyLogoUrl:       resolveTemplateLogo(template, owner),
-            ownerCompanyLogo:     owner?.company_logo || '',
-            parties:              partiesForEmail,
-          });
-          console.log(`[employeeSign] Completion email sent to ${session.recipientEmail}`);
-        } else {
-          console.error('[employeeSign] No signed PDF available — completion email skipped');
-        }
+        await deliverEmployeeSignedCopyEmail({
+          session:    activeSession,
+          templateCtx: template,
+          ownerUser:  owner,
+          pdfBuffer,
+          sessionDoc,
+        });
       } catch (e) {
-        console.error('[employeeSign] Completion email failed:', e.message);
+        console.error('[employeeSign] Signed copy email failed:', e.message);
       }
 
       // ── Step 8: If all signed → owner + CC emails ──
       if (freshTemplate?.status === 'completed') {
         try {
-          // Owner notification
+          let emailPdfBuffer = pdfBuffer;
+          if (!emailPdfBuffer) {
+            try {
+              emailPdfBuffer = await loadEmployeeSessionPdfBytes(activeSession);
+            } catch (e) {
+              console.error('[employeeSign] Owner/CC PDF load failed:', e.message);
+            }
+          }
+
+          // Owner notification when all employees have signed
           await sendCompletionEmail?.({
             recipientEmail:   owner?.email,
             recipientName:    owner?.full_name || 'Owner',
@@ -1638,6 +1776,7 @@ const employeeSign = asyncHandler(async (req, res) => {
             companyName:      template.companyName || '',
             companyLogoUrl:   resolveTemplateLogo(template, owner),
             ownerCompanyLogo: owner?.company_logo || '',
+            emailHeaderColor: template.emailHeaderColor,
             parties:          partiesForEmail,
           });
 
@@ -1653,6 +1792,7 @@ const employeeSign = asyncHandler(async (req, res) => {
                 companyName:      template.companyName || '',
                 companyLogoUrl:   resolveTemplateLogo(template, owner),
                 ownerCompanyLogo: owner?.company_logo || '',
+                emailHeaderColor: template.emailHeaderColor,
                 isCC:             true,
                 parties:          partiesForEmail,
               }),
@@ -1714,7 +1854,11 @@ const employeeSign = asyncHandler(async (req, res) => {
 const employeeDecline = asyncHandler(async (req, res) => {
   const { reason = '' } = req.body;
 
-  const session = await TemplateSession.findByToken(req.params.token);
+  const ref = req.params.slug
+    ? { slug: req.params.slug, signCode: req.params.signCode }
+    : { token: req.params.token };
+
+  const session = await findTemplateSession(ref);
   if (!session)
     return res.status(404).json({ success: false, message: 'Invalid signing link.' });
 
@@ -1836,11 +1980,7 @@ const getSessionSignedPdf = asyncHandler(async (req, res) => {
 
     session = await ensureEmployeeSessionPdf(session, templateCtx);
 
-    const buffer = await getPdfBytes({
-      fileUrl:      session.signedFileUrl,
-      filePublicId: session.signedFilePublicId,
-      localPdfPath: session.localSignedPdfPath,
-    });
+    const buffer = await loadEmployeeSessionPdfBytes(session);
 
     const safeName = `${template.title}_${session.recipientName}`
       .replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -1885,24 +2025,21 @@ const resendSignedCopy = asyncHandler(async (req, res) => {
   try {
     session = await ensureEmployeeSessionPdf(session, templateCtx);
     const { sessionDoc } = await buildEmployeeSessionPdf(session, templateCtx);
-    const pdfBuffer = await getPdfBytes({
-      fileUrl:      session.signedFileUrl,
-      filePublicId: session.signedFilePublicId,
-      localPdfPath: session.localSignedPdfPath,
+
+    const ownerUser = await resolveTemplateOwnerUser(templateCtx);
+    const result = await deliverEmployeeSignedCopyEmail({
+      session,
+      templateCtx,
+      ownerUser,
+      sessionDoc,
     });
 
-    await sendCompletionEmail?.({
-      recipientEmail:       session.recipientEmail,
-      recipientName:        session.recipientName,
-      recipientDesignation: session.recipientDesignation || '',
-      documentTitle:        template.title,
-      pdfBuffer,
-      signedPdfUrl:         session.signedFileUrl || '',
-      companyName:          template.companyName || '',
-      companyLogoUrl:       resolveTemplateLogo(template, req.user),
-      ownerCompanyLogo:     req.user?.company_logo || '',
-      parties:              sessionDoc.parties,
-    });
+    if (!result?.success) {
+      return res.status(502).json({
+        success: false,
+        message: result?.error || `Could not deliver email to ${session.recipientEmail}.`,
+      });
+    }
 
     return res.json({
       success: true,
@@ -1987,10 +2124,11 @@ const resendEmail = asyncHandler(async (req, res) => {
 // ════════════════════════════════════════════════════
 const getTemplatePdf = asyncHandler(async (req, res) => {
   try {
-    const session = await TemplateSession.findOne({
-      token:     req.params.token,
-      isDeleted: { $ne: true },
-    }).populate('template', 'fileUrl filePublicId bossSignedFileUrl title localPdfPath localBossSignedPdfPath');
+    const ref = req.params.slug
+      ? { slug: req.params.slug, signCode: req.params.signCode }
+      : { token: req.params.token };
+
+    const session = await findTemplateSession(ref);
 
     if (!session)
       return res.status(404).send('Not found');
@@ -2169,6 +2307,7 @@ module.exports = {
   getTemplateSessions,
   getTemplateAudit,
   getSessionByToken,
+  getSessionByPrettyLink,
   getSessionSignedPdf,
   getOwnerTemplatePdf,
   resendSignedCopy,
