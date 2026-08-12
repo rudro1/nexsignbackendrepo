@@ -9,6 +9,7 @@ const crypto             = require('crypto');
 const { v2: cloudinary } = require('cloudinary');
 
 const Document = require('../models/Document');
+const User     = require('../models/User');
 const AuditLog = require('../models/AuditLog');
 const { auth } = require('../middleware/auth');
 
@@ -736,16 +737,11 @@ router.post(
         status:     doc.status,
       });
 
-      const emailResult = await sendSigningEmail(signingPayload);
-      if (emailResult?.success === false) {
-        return res.status(502).json({
-          success:  false,
-          message:  `Document saved but signing email failed: ${emailResult.error || 'SMTP error'}. Check SMTP settings on the server.`,
-          document: sanitizeDoc(doc),
-        });
-      }
-
       res.json({ success: true, document: sanitizeDoc(doc), emailSent: true });
+
+      sendSigningEmail(signingPayload).catch(emailErr => {
+        console.error('[upload-and-send] First email failed:', emailErr.message);
+      });
 
       parsedCC.forEach(cc =>
         sendCCEmail({
@@ -783,7 +779,8 @@ router.get('/sign/validate/:token', async (req, res) => {
       });
     }
 
-    const doc = await Document.findOne({ 'parties.token': token });
+    const doc = await Document.findOne({ 'parties.token': token })
+      .select('title totalPages fields parties companyName companyLogo emailHeaderColor message status useCustomEmailBody customEmailBody customEmailSubject owner');
     if (!doc) {
       return res.status(404).json({
         success: false, code: 'INVALID_LINK',
@@ -966,19 +963,21 @@ router.post('/sign/submit', async (req, res) => {
     // ✅ Server time — always correct, browser time এর উপর depend করে না
     const localTime = new Date().toUTCString();
 
-    // ✅ GPS coordinates আছে → reverse geocode (exact location)
-    // না থাকলে → IP based fallback
+    // Geo lookup — cap at 2s so signers are not blocked on external APIs
     let geo = null;
-
-    if (latitude && longitude) {
-      console.log(`[geo] GPS coordinates received: ${latitude}, ${longitude}`);
-      geo = await reverseGeocode(parseFloat(latitude), parseFloat(longitude));
-      if (geo) console.log(`[geo] Reverse geocode success: ${geo.display}`);
-    }
-
-    if (!geo) {
-      console.log(`[geo] Falling back to IP: ${ip}`);
-      geo = await getGeoLocation(ip);
+    try {
+      geo = await Promise.race([
+        (async () => {
+          if (latitude && longitude) {
+            const gpsGeo = await reverseGeocode(parseFloat(latitude), parseFloat(longitude));
+            if (gpsGeo) return gpsGeo;
+          }
+          return getGeoLocation(ip);
+        })(),
+        new Promise(resolve => setTimeout(() => resolve(null), 2000)),
+      ]);
+    } catch (geoErr) {
+      console.warn('[sign/submit] Geo lookup failed:', geoErr.message);
     }
 
     party.status          = 'signed';
@@ -1063,30 +1062,30 @@ router.post('/sign/submit', async (req, res) => {
       });
 
       const nextParty = doc.parties[nextIdx];
-      try {
-        await sendSigningEmail({
-          recipientEmail:       nextParty.email,
-          recipientName:        nextParty.name,
-          recipientDesignation: nextParty.designation,
-          senderName:           party.name,
-          senderDesignation:    party.designation,
-          documentTitle:        doc.title,
-          signingLink:          `${FRONT()}/sign/${nextToken}`,
-          companyLogoUrl:       doc.companyLogo,
-        ownerCompanyLogo:     req.user.company_logo || '',
-          companyName:          doc.companyName,
-          emailHeaderColor:     doc.emailHeaderColor,
-          partyNumber:          nextIdx + 1,
-          totalParties:         doc.parties.length,
-          message:              doc.message,
-          ccList:               doc.ccList,
-          useCustomEmailBody:   doc.useCustomEmailBody,
-          customEmailBody:      doc.customEmailBody,
-          customEmailSubject:   doc.customEmailSubject,
-        });
-      } catch (emailErr) {
+      const ownerUser = await User.findById(doc.owner).select('company_logo').lean();
+
+      sendSigningEmail({
+        recipientEmail:       nextParty.email,
+        recipientName:        nextParty.name,
+        recipientDesignation: nextParty.designation,
+        senderName:           party.name,
+        senderDesignation:    party.designation,
+        documentTitle:        doc.title,
+        signingLink:          `${FRONT()}/sign/${nextToken}`,
+        companyLogoUrl:       doc.companyLogo,
+        ownerCompanyLogo:     ownerUser?.company_logo || '',
+        companyName:          doc.companyName,
+        emailHeaderColor:     doc.emailHeaderColor,
+        partyNumber:          nextIdx + 1,
+        totalParties:         doc.parties.length,
+        message:              doc.message,
+        ccList:               doc.ccList,
+        useCustomEmailBody:   doc.useCustomEmailBody,
+        customEmailBody:      doc.customEmailBody,
+        customEmailSubject:   doc.customEmailSubject,
+      }).catch(emailErr => {
         console.error('[sign/submit] Next signer email failed:', emailErr.message);
-      }
+      });
 
       emitSocket(req, 'document:party_signed', {
         documentId: String(doc._id),
@@ -1484,6 +1483,9 @@ async function _finalizeDocument(req, doc) {
 
     // ✅ Step 6: Emails — parallel but don't block
     console.log(`[finalize] Step 4: Sending emails...`);
+    const ownerRecord = await User.findById(freshDoc.owner).select('company_logo').lean();
+    const ownerLogo   = ownerRecord?.company_logo || '';
+
     const emailTargets = [
       ...freshDoc.parties.map(p => ({
         recipientEmail:       p.email,
@@ -1509,7 +1511,9 @@ async function _finalizeDocument(req, doc) {
           pdfBuffer:            finalBuffer,
           signedPdfUrl:         uploaded.secure_url,
           companyLogoUrl:       freshDoc.companyLogo,
+          ownerCompanyLogo:     ownerLogo,
           companyName:          freshDoc.companyName,
+          emailHeaderColor:     freshDoc.emailHeaderColor,
           parties:              partiesWithAudit,
           ccList:               freshDoc.ccList,
           isCC:                 t.isCC,

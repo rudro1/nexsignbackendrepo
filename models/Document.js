@@ -171,6 +171,7 @@ const documentSchema = new mongoose.Schema(
 );
 
 // ── Indexes ───────────────────────────────────────────────────────
+documentSchema.index({ owner: 1, isTemplate: 1, updatedAt: -1 });
 documentSchema.index({ owner: 1, status: 1 });
 documentSchema.index({ owner: 1, createdAt: -1 });
 documentSchema.index({ 'parties.token': 1 });

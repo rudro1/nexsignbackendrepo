@@ -1588,7 +1588,8 @@ const employeeSign = asyncHandler(async (req, res) => {
             pdfBuffer:            pdfBuffer || null,
             signedPdfUrl:         signedFileUrl || template.bossSignedFileUrl || '',
             companyName:          template.companyName || '',
-            companyLogoUrl:       template.companyLogo || '',
+            companyLogoUrl:       resolveTemplateLogo(template, req.user),
+            ownerCompanyLogo:     req.user?.company_logo || '',
             parties:              sessionDoc.parties,
           });
         }
@@ -1610,7 +1611,8 @@ const employeeSign = asyncHandler(async (req, res) => {
             pdfBuffer:       pdfBuffer || null,
             signedPdfUrl:    signedFileUrl || '',
             companyName:     template.companyName || '',
-            companyLogoUrl:  template.companyLogo || '',
+            companyLogoUrl:  resolveTemplateLogo(template, owner),
+            ownerCompanyLogo: owner?.company_logo || '',
             parties:         sessionDoc?.parties || [],
           });
 
@@ -1624,7 +1626,8 @@ const employeeSign = asyncHandler(async (req, res) => {
                 pdfBuffer:       pdfBuffer || null,
                 signedPdfUrl:    signedFileUrl || '',
                 companyName:     template.companyName || '',
-                companyLogoUrl:  template.companyLogo || '',
+                companyLogoUrl:  resolveTemplateLogo(template, owner),
+                ownerCompanyLogo: owner?.company_logo || '',
                 isCC:            true,
                 parties:         sessionDoc.parties,
               })
@@ -1838,7 +1841,8 @@ const resendSignedCopy = asyncHandler(async (req, res) => {
       pdfBuffer,
       signedPdfUrl:         session.signedFileUrl || '',
       companyName:          template.companyName || '',
-      companyLogoUrl:       template.companyLogo || '',
+      companyLogoUrl:       resolveTemplateLogo(template, req.user),
+      ownerCompanyLogo:     req.user?.company_logo || '',
       parties:              sessionDoc.parties,
     });
 

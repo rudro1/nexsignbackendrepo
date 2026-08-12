@@ -3197,8 +3197,19 @@ async function sendEmail(type, data, attachments = []) {
 // WRAPPER FUNCTIONS (Used by Routes)
 // ════════════════════════════════════════════════════════════════
 
+/** Pass branding through so composeEmail resolveEmailLogo can fall back to owner profile */
+function withEmailBranding(data, extra = {}) {
+  return {
+    ...extra,
+    companyLogoUrl:     data.companyLogoUrl || data.companyLogo || '',
+    ownerCompanyLogo:   data.ownerCompanyLogo || '',
+    companyName:        data.companyName || 'NexSign',
+    emailHeaderColor:   data.emailHeaderColor,
+  };
+}
+
 async function sendSigningEmail(data) {
-  return sendEmail('signing_request', {
+  return sendEmail('signing_request', withEmailBranding(data, {
     to:                data.recipientEmail,
     signerName:        data.recipientName,
     senderName:        data.senderName,
@@ -3206,35 +3217,29 @@ async function sendSigningEmail(data) {
     senderEmail:       data.senderEmail,
     docTitle:          data.documentTitle,
     actionUrl:         data.signingLink || data.actionUrl,
-    companyLogo:       data.companyLogoUrl || data.companyLogo,
-    companyName:       data.companyName || 'NexSign',
-    emailHeaderColor:  data.emailHeaderColor,
     customMessage:     data.message,
     partyNumber:       data.partyNumber,
     totalParties:      data.totalParties,
     useCustomEmailBody: data.useCustomEmailBody,
     customEmailBody:    data.customEmailBody,
     customEmailSubject: data.customEmailSubject,
-  });
+  }));
 }
 
 async function sendBossApprovalEmail(data) {
-  return sendEmail('signing_request', {
+  return sendEmail('signing_request', withEmailBranding(data, {
     to:                data.bossEmail,
     signerName:        data.bossName,
     senderName:        data.senderName || data.bossName,
     senderDesignation: data.senderDesignation || '',
     docTitle:          data.documentTitle,
     actionUrl:         data.signingLink,
-    companyLogo:       data.companyLogoUrl || data.companyLogo,
-    companyName:       data.companyName || 'NexSign',
-    emailHeaderColor:  data.emailHeaderColor,
     customMessage:     data.message,
-  });
+  }));
 }
 
 async function sendEmployeeSigningEmail(data) {
-  return sendEmail('employee_signing_request', {
+  return sendEmail('employee_signing_request', withEmailBranding(data, {
     to:                  data.employeeEmail || data.to,
     employeeName:        data.employeeName,
     employeeDesignation: data.employeeDesignation || '',
@@ -3243,47 +3248,38 @@ async function sendEmployeeSigningEmail(data) {
     senderEmail:         data.senderEmail || data.bossEmail,
     docTitle:            data.documentTitle || data.docTitle,
     actionUrl:           data.signingLink || data.actionUrl,
-    companyLogo:         data.companyLogoUrl || data.companyLogo,
-    companyName:         data.companyName || 'NexSign',
-    emailHeaderColor:    data.emailHeaderColor,
     customMessage:       data.message || data.customMessage,
     expiryDate:          data.expiryDate,
     useCustomEmailBody:  data.useCustomEmailBody,
     customEmailBody:     data.customEmailBody,
     customEmailSubject:  data.customEmailSubject,
-  });
+  }));
 }
 
 async function sendCampaignBossEmail(data) {
-  return sendEmail('campaign_boss_sign', {
-    to:               data.bossEmail,
-    signerName:       data.bossName,
-    docTitle:         data.documentTitle || data.docTitle,
-    actionUrl:        data.signingLink || data.actionUrl,
-    companyName:      data.companyName || 'NexSign',
-    companyLogo:      data.companyLogoUrl || data.companyLogo,
-    emailHeaderColor: data.emailHeaderColor,
-    ownerName:        data.ownerName,
-    employeeCount:    data.employeeCount || 0,
-    approverCount:    data.approverCount || 0,
-  });
+  return sendEmail('campaign_boss_sign', withEmailBranding(data, {
+    to:            data.bossEmail,
+    signerName:    data.bossName,
+    docTitle:      data.documentTitle || data.docTitle,
+    actionUrl:     data.signingLink || data.actionUrl,
+    ownerName:     data.ownerName,
+    employeeCount: data.employeeCount || 0,
+    approverCount: data.approverCount || 0,
+  }));
 }
 
 async function sendCampaignApproverEmail(data) {
-  return sendEmail('campaign_approver', {
+  return sendEmail('campaign_approver', withEmailBranding(data, {
     to:                  data.approverEmail || data.to,
     signerName:          data.approverName,
     employeeDesignation: data.approverDesignation || '',
     docTitle:            data.documentTitle || data.docTitle,
     actionUrl:           data.approvalLink || data.actionUrl,
-    companyName:         data.companyName || 'NexSign',
-    companyLogo:         data.companyLogoUrl || data.companyLogo,
-    emailHeaderColor:    data.emailHeaderColor,
     stepNumber:          data.stepNumber || 1,
     totalSteps:          data.totalSteps || 1,
     isLastApprover:      !!data.isLastApprover,
     previousApprovers:   data.previousApprovers || '',
-  });
+  }));
 }
 
 async function sendEmailDeliveryFailureNotice(data) {
@@ -3340,32 +3336,26 @@ async function sendCompletionEmail(data) {
     auditNote += '\n\nA Certificate of Completion (legal audit trail) is included as the final page of the attached PDF.';
   }
 
-  return sendEmail(data.isCC ? 'cc_notification' : 'completion', {
+  return sendEmail(data.isCC ? 'cc_notification' : 'completion', withEmailBranding(data, {
     to:               data.recipientEmail,
     signerName:       data.recipientName,
     ccName:           data.recipientName,
     senderName:       data.senderName || data.companyName,
     docTitle:         data.documentTitle,
     signedPdfUrl:     data.signedPdfUrl,
-    companyLogo:      data.companyLogoUrl,
-    companyName:      data.companyName || 'NexSign',
-    emailHeaderColor: data.emailHeaderColor,
     customMessage:    auditNote,
-  }, attachments);
+  }), attachments);
 }
 
 async function sendCCEmail(data) {
-  return sendEmail('cc_notification', {
-    to:               data.recipientEmail,
-    signerName:       data.recipientName,
-    ccName:           data.recipientName || data.ccName,
-    senderName:       data.senderName,
+  return sendEmail('cc_notification', withEmailBranding(data, {
+    to:                data.recipientEmail,
+    signerName:        data.recipientName,
+    ccName:            data.recipientName || data.ccName,
+    senderName:        data.senderName,
     senderDesignation: data.senderDesignation || '',
-    docTitle:         data.documentTitle,
-    companyLogo:      data.companyLogoUrl,
-    companyName:      data.companyName || 'NexSign',
-    emailHeaderColor: data.emailHeaderColor,
-  });
+    docTitle:          data.documentTitle,
+  }));
 }
 
 async function sendFeedbackEmail(userEmail, userName, stars, message = '') {
