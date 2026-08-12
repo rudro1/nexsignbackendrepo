@@ -477,6 +477,8 @@ const validateBossToken = asyncHandler(async (req, res) => {
       employeeCount: doc.recipients?.length || 0,
       ownerName:     owner?.full_name || '',
       sourceType:    type,
+      fields:        (doc.fields || []).filter(f => f.assignedTo === 'boss'),
+      totalPages:    doc.totalPages || 1,
     },
   });
 });
