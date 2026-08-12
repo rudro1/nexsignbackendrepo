@@ -141,45 +141,96 @@ app.all('/socket.io*', (_req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// MONGODB — singleton connection
+// MONGODB — singleton connection (Vercel serverless safe)
 // ═══════════════════════════════════════════════════════════════
-let isConnecting  = false;
-let connectPromise = null;
+function getMongoUri() {
+  const raw = process.env.MONGO_URI || process.env.MONGODB_URI || '';
+  return String(raw).trim().replace(/^["']|["']$/g, '');
+}
+
+let cached = global.__nexsignMongoose;
+if (!cached) {
+  cached = global.__nexsignMongoose = { conn: null, promise: null };
+}
 
 async function connectDB() {
-  // Already connected
   if (mongoose.connection.readyState === 1) return;
 
-  // Connection in progress — wait for it
-  if (connectPromise) {
-    await connectPromise;
-    return;
-  }
+  if (cached.conn && mongoose.connection.readyState === 1) return;
 
-  if (!process.env.MONGO_URI) {
+  const uri = getMongoUri();
+  if (!uri) {
     throw new Error('MONGO_URI environment variable is missing!');
   }
 
-  connectPromise = mongoose
-    .connect(process.env.MONGO_URI, {
-      serverSelectionTimeoutMS: 10_000,
+  if (cached.promise) {
+    await cached.promise;
+    return;
+  }
+
+  cached.promise = mongoose
+    .connect(uri, {
+      serverSelectionTimeoutMS: 20_000,
       socketTimeoutMS:          45_000,
-      maxPoolSize:              10,
+      maxPoolSize:              5,
+      bufferCommands:           false,
     })
-    .then(() => {
+    .then((conn) => {
+      cached.conn = conn;
+      cached.promise = null;
       console.log('✅ MongoDB connected');
-      connectPromise = null;
+      return conn;
     })
     .catch((err) => {
+      cached.promise = null;
       console.error('❌ MongoDB connection failed:', err.message);
-      connectPromise = null;
       throw err;
     });
 
-  await connectPromise;
+  await cached.promise;
 }
 
-// DB connection middleware — runs before every request
+// Health + root — no DB required (helps debug Vercel env)
+app.get(['/', '/api/health'], async (_req, res) => {
+  const uri = getMongoUri();
+  const states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+  const base = {
+    success:          true,
+    status:           'ok',
+    mongoConfigured:  !!uri,
+    db:               states[mongoose.connection.readyState] || 'unknown',
+    env:              process.env.NODE_ENV || 'development',
+    ts:               new Date().toISOString(),
+    version:          process.env.npm_package_version || '1.0.0',
+  };
+
+  if (!uri) {
+    return res.status(503).json({
+      ...base,
+      success: false,
+      code:    'MONGO_URI_MISSING',
+      message: 'Set MONGO_URI in Vercel Environment Variables, then redeploy.',
+    });
+  }
+
+  try {
+    await connectDB();
+    return res.json({ ...base, db: 'connected' });
+  } catch (err) {
+    return res.status(503).json({
+      ...base,
+      success: false,
+      code:    'DB_UNAVAILABLE',
+      message: 'Database temporarily unavailable. Please try again.',
+      hint:    err.message.includes('whitelist')
+        ? 'MongoDB Atlas → Network Access → add 0.0.0.0/0, then wait 2 minutes.'
+        : 'Check MONGO_URI user/password/cluster host in Vercel env vars.',
+      dbError: process.env.NODE_ENV === 'production' ? undefined : err.message,
+    });
+  }
+});
+
+// DB connection middleware — runs before API routes
 app.use(async (req, res, next) => {
   try {
     await connectDB();
@@ -190,23 +241,11 @@ app.use(async (req, res, next) => {
       success: false,
       code:    'DB_UNAVAILABLE',
       message: 'Database temporarily unavailable. Please try again.',
+      hint:    err.message.includes('whitelist')
+        ? 'MongoDB Atlas → Network Access → add 0.0.0.0/0'
+        : undefined,
     });
   }
-});
-
-// ═══════════════════════════════════════════════════════════════
-// HEALTH CHECK
-// ═══════════════════════════════════════════════════════════════
-app.get('/api/health', (_req, res) => {
-  const states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
-  res.json({
-    success:  true,
-    status:   'ok',
-    db:       states[mongoose.connection.readyState] || 'unknown',
-    env:      process.env.NODE_ENV || 'development',
-    ts:       new Date().toISOString(),
-    version:  process.env.npm_package_version || '1.0.0',
-  });
 });
 
 // ═══════════════════════════════════════════════════════════════
