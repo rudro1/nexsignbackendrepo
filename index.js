@@ -2,6 +2,9 @@
 
 require('dotenv').config();
 
+const { getFrontendUrl } = require('./utils/appUrls');
+console.log(`🔗 Email link base URL: ${getFrontendUrl()}`);
+
 const express  = require('express');
 const mongoose = require('mongoose');
 const cors     = require('cors');
@@ -432,6 +435,7 @@ if (process.env.NODE_ENV !== 'production') {
   server.listen(PORT, () => {
     console.log(`🚀 Server running: http://localhost:${PORT}`);
     console.log(`📋 Health check:   http://localhost:${PORT}/api/health`);
+    console.log(`🔗 Email links use: ${getFrontendUrl()}`);
   });
 }
 

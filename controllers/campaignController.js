@@ -14,6 +14,7 @@ let emailService = {};
 try { emailService = require('../utils/emailService'); } catch { /* optional */ }
 
 const { getPdfBytes, sendPdf } = require('../utils/pdfStorage');
+const { links } = require('../utils/appUrls');
 
 const {
   sendEmployeeSigningEmail,
@@ -27,9 +28,6 @@ const asyncHandler = fn => (req, res, next) =>
 
 const generateToken = () => crypto.randomBytes(32).toString('hex');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-const FRONT = () =>
-  (process.env.FRONTEND_URL || 'http://127.0.0.1:5174').replace(/\/$/, '');
 
 function resolveCampaignLogo(campaign, ownerUser) {
   return campaign?.companyLogo || ownerUser?.company_logo || '';
@@ -83,7 +81,7 @@ async function dispatchEmployeeEmailForCampaign({ session, campaign, bossUser })
     employeeName:        session.recipientName,
     employeeDesignation: session.recipientDesignation || '',
     documentTitle:       campaign.title,
-    signingLink:         `${FRONT()}/template-sign/${session.token}`,
+    signingLink:         links.templateSign(session.token),
     bossName:            campaign.boss?.name || bossUser.full_name || 'Authoriser',
     bossDesignation:     campaign.boss?.designation || '',
     bossEmail:           campaign.boss?.email || bossUser.email,
@@ -151,7 +149,7 @@ async function emailCurrentApprover(campaign, ownerUser) {
     approverName:        approver.name,
     approverDesignation: approver.designation || '',
     documentTitle:       campaign.title,
-    approvalLink:        `${FRONT()}/template-campaign/approve/${approver.token}`,
+    approvalLink:        links.approverReview(approver.token),
     companyName:         campaign.companyName,
     companyLogoUrl:      resolveCampaignLogo(campaign, ownerUser),
     ownerCompanyLogo:    ownerUser?.company_logo || '',
@@ -410,7 +408,7 @@ const reuseTemplate = asyncHandler(async (req, res) => {
     bossEmail:       bossInfo.email,
     bossName:        bossInfo.name,
     documentTitle:   campaign.title,
-    signingLink:     `${FRONT()}/template-campaign/boss/${campaign.bossToken}`,
+    signingLink:     links.bossSign(campaign.bossToken),
     companyName:     campaign.companyName,
     companyLogoUrl:   resolveCampaignLogo(campaign, req.user),
     ownerCompanyLogo: req.user.company_logo || '',

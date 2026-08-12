@@ -26,6 +26,7 @@ try {
 }
 
 const { getPdfBytes, sendPdf, savePdfBuffer } = require('../utils/pdfStorage');
+const { links } = require('../utils/appUrls');
 const {
   resolveSigningLocation,
   toAuditLocation,
@@ -39,6 +40,7 @@ const {
   sendCompletionEmail,
   sendCCEmail,
   sendDeclinedEmail,
+  sendCampaignBossEmail,
   sendCampaignApproverEmail,
   buildEmailPreview,
 } = emailService;
@@ -73,7 +75,7 @@ async function dispatchEmployeeEmail({ session, template, bossUser }) {
     employeeName:        session.recipientName,
     employeeDesignation: session.recipientDesignation || '',
     documentTitle:       template.title,
-    signingLink:         `${FRONT()}/template-sign/${session.token}`,
+    signingLink:         links.templateSign(session.token),
     bossName:            bossUser.full_name || bossUser.name || 'Your Manager',
     bossDesignation:     bossUser.designation || '',
     bossEmail:           bossUser.email,
@@ -132,7 +134,7 @@ async function emailTemplateApprover(template, ownerUser) {
     approverName:        approver.name,
     approverDesignation: approver.designation || '',
     documentTitle:       template.title,
-    approvalLink:        `${FRONT()}/template-campaign/approve/${approver.token}`,
+    approvalLink:        links.approverReview(approver.token),
     companyName:         template.companyName,
     companyLogoUrl:      resolveTemplateLogo(template, ownerUser),
     ownerCompanyLogo:    ownerUser?.company_logo || '',
@@ -328,10 +330,6 @@ async function getGeoInfo(ip) {
   }
 }
 
-const FRONT = () =>
-  (process.env.FRONTEND_URL || 'https://nexsignfrontend.vercel.app')
-    .replace(/\/$/, '');
-
 // ── Safe audit log ────────────────────────────────
 async function safeAuditLog(payload) {
   try {
@@ -479,14 +477,15 @@ const createTemplate = asyncHandler(async (req, res) => {
   // Send boss approval email
   if (bossSignsFirst) {
     try {
-   await sendBossApprovalEmail?.({
+   await sendCampaignBossEmail?.({
     bossEmail:       bossInfo.email,
     bossName:        bossInfo.name || 'Authoriser',
     bossDesignation: bossInfo.designation || '',
     documentTitle:   template.title,
-    signingLink:     `${FRONT()}/template-campaign/boss/${bossToken}`,
+    signingLink:     links.bossSign(bossToken),
     employeeCount:   parsedRecipients.length,
-    senderName:      req.user.full_name || req.user.name || 'Sender',
+    approverCount:   parsedApprovers?.length || 0,
+    ownerName:       req.user.full_name || req.user.name || 'Sender',
     companyName:     template.companyName || '',
     companyLogoUrl:  resolveTemplateLogo(template, req.user),
     ownerCompanyLogo: req.user.company_logo || '',
@@ -2018,7 +2017,7 @@ const previewEmployeeEmail = asyncHandler(async (req, res) => {
     employeeName:        employee.name || 'Employee Name',
     employeeDesignation: employee.designation || '',
     docTitle:            body.documentTitle || template?.title || 'Document Title',
-    actionUrl:           `${FRONT()}/template-sign/preview-token`,
+    actionUrl:           links.templateSignPreview(),
     bossName:            body.bossName || bossUser.full_name || 'Manager Name',
     bossDesignation:     body.bossDesignation || bossUser.designation || '',
     companyName:         body.companyName || template?.companyName || 'Company Name',

@@ -84,9 +84,7 @@ function handleMulterError(err, req, res, next) {
 // ═══════════════════════════════════════════════════════════════
 // HELPERS
 // ═══════════════════════════════════════════════════════════════
-const FRONT = () =>
-  (process.env.FRONTEND_URL || 'https://nexsignfrontend.vercel.app')
-    .replace(/\/$/, '');
+const { links } = require('../utils/appUrls');
 
 async function uploadToCloudinary(buffer, options = {}) {
   checkCloudinary();
@@ -533,7 +531,7 @@ router.post('/email-preview', auth, async (req, res) => {
       senderDesignation:   body.senderDesignation || req.user.designation || '',
       senderEmail:         body.senderEmail || req.user.email,
       docTitle:            body.documentTitle || body.title || 'Document Title',
-      actionUrl:           `${FRONT()}/sign/preview-token`,
+      actionUrl:           links.sequentialSignPreview(),
       companyLogo:         body.companyLogo || req.user.company_logo || '',
       companyName:         body.companyName || req.user.company_name || 'Company Name',
       emailHeaderColor:    body.emailHeaderColor || '#0f172a',
@@ -716,7 +714,7 @@ router.post(
         senderDesignation:    req.user.designation,
         senderEmail:          req.user.email,
         documentTitle:        doc.title,
-        signingLink:          `${FRONT()}/sign/${firstToken}`,
+        signingLink:          links.sequentialSign(firstToken),
         companyLogoUrl:       doc.companyLogo,
         ownerCompanyLogo:     req.user.company_logo || '',
         companyName:          doc.companyName,
@@ -1095,7 +1093,7 @@ router.post('/sign/submit', async (req, res) => {
         senderName:           party.name,
         senderDesignation:    party.designation,
         documentTitle:        doc.title,
-        signingLink:          `${FRONT()}/sign/${nextToken}`,
+        signingLink:          links.sequentialSign(nextToken),
         companyLogoUrl:       doc.companyLogo,
         ownerCompanyLogo:     ownerUser?.company_logo || '',
         companyName:          doc.companyName,

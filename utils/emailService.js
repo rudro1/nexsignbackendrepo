@@ -2375,6 +2375,7 @@
  */
 
 const nodemailer = require('nodemailer');
+const { sanitizeFrontendLink } = require('./appUrls');
 
 // ─── Transport (configure via env) ───────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -2460,7 +2461,7 @@ function senderLine(name, designation, company) {
 /** Replace {{tokens}} in custom email subject/body */
 function applyEmailTokens(text, data) {
   if (!text) return '';
-  const link = data.actionUrl || data.signingLink || '';
+  const link = sanitizeFrontendLink(data.actionUrl || data.signingLink || '');
   const replacements = {
     '{{signerName}}':     data.signerName || data.recipientName || data.employeeName || '',
     '{{recipientName}}':  data.recipientName || data.signerName || data.employeeName || '',
@@ -3097,7 +3098,7 @@ function composeEmail(type, data, attachments = []) {
   })();
 
   const senderName = data.senderName || data.bossName || 'NexSign';
-  const actionUrl  = data.actionUrl || data.signingLink || '';
+  const actionUrl  = sanitizeFrontendLink(data.actionUrl || data.signingLink || '');
 
   const useCustomBody = !!(data.useCustomEmailBody && String(data.customEmailBody || '').trim());
 
