@@ -25,6 +25,7 @@ router.post  ('/:id/resend-failed',              auth, ctrl.resendFailedEmails);
 router.post  ('/:id/sessions/:sessionId/resend', auth, ctrl.resendEmail);
 router.post  ('/:id/sessions/:sessionId/resend-signed', auth, ctrl.resendSignedCopy);
 router.get   ('/:id/sessions/:sessionId/pdf', auth, ctrl.getSessionSignedPdf);
+router.get   ('/:id/pdf',                         auth, ctrl.getOwnerTemplatePdf);
 
 router.get   ('/:id/sessions',                      auth, ctrl.getTemplateSessions);
 router.get   ('/:id/audit',                         auth, ctrl.getTemplateAudit);

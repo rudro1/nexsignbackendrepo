@@ -1775,6 +1775,38 @@ const employeeDecline = asyncHandler(async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════
+// 11a-b. GET TEMPLATE MASTER PDF (owner — boss-signed base)
+// GET /api/templates/:id/pdf
+// ════════════════════════════════════════════════════
+const getOwnerTemplatePdf = asyncHandler(async (req, res) => {
+  try {
+    const template = await Template.findOne({
+      _id:       req.params.id,
+      owner:     req.user._id,
+      isDeleted: false,
+    }).lean();
+
+    if (!template)
+      return res.status(404).json({ success: false, message: 'Template not found.' });
+
+    const record = {
+      fileUrl:            template.bossSignedFileUrl || template.fileUrl,
+      filePublicId:       template.filePublicId,
+      localPdfPath:       template.localPdfPath,
+      localSignedPdfPath: template.localBossSignedPdfPath,
+      bossSignedFileUrl:  template.bossSignedFileUrl,
+    };
+
+    const buffer = await getPdfBytes(record, { preferSigned: !!template.bossSignedFileUrl });
+    const safeName = (template.title || 'template').replace(/[^a-zA-Z0-9._-]/g, '_');
+    return sendPdf(res, buffer, safeName);
+  } catch (err) {
+    console.error('[getOwnerTemplatePdf]', err.message);
+    return res.status(502).json({ success: false, message: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════
 // 11a. GET EMPLOYEE SIGNED PDF (owner)
 // GET /api/templates/:id/sessions/:sessionId/pdf
 // ════════════════════════════════════════════════════
@@ -2142,6 +2174,7 @@ module.exports = {
   getTemplateAudit,
   getSessionByToken,
   getSessionSignedPdf,
+  getOwnerTemplatePdf,
   resendSignedCopy,
   employeeSign,
   employeeDecline,
