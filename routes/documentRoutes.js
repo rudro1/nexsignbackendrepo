@@ -478,7 +478,8 @@ router.post(
         fileSize: req.file.size,
         status:   'draft',
       });
-      doc.localPdfPath = savePdfBuffer(req.file.buffer, String(doc._id));
+      const cachedName = savePdfBuffer(req.file.buffer, String(doc._id));
+      if (cachedName) doc.localPdfPath = cachedName;
       await doc.save();
       return res.status(201).json({ success: true, document: doc });
     } catch (err) {
@@ -610,7 +611,8 @@ router.post(
           fileName: req.file.originalname,
           fileSize: req.file.size,
         });
-        doc.localPdfPath = savePdfBuffer(req.file.buffer, 'draft');
+        const draftCache = savePdfBuffer(req.file.buffer, 'draft');
+        if (draftCache) doc.localPdfPath = draftCache;
       }
 
       if (!doc) {
@@ -621,11 +623,13 @@ router.post(
 
       // Ensure local PDF copy exists (Cloudinary raw URLs return 401 when PDF delivery is restricted)
       if (req.file?.buffer) {
-        doc.localPdfPath = savePdfBuffer(req.file.buffer, String(doc._id || 'send'));
+        const sendCache = savePdfBuffer(req.file.buffer, String(doc._id || 'send'));
+        if (sendCache) doc.localPdfPath = sendCache;
       } else if (!doc.localPdfPath && doc.fileUrl) {
         try {
           const bytes = await getPdfBytes(doc);
-          doc.localPdfPath = savePdfBuffer(bytes, String(doc._id));
+          const remoteCache = savePdfBuffer(bytes, String(doc._id));
+          if (remoteCache) doc.localPdfPath = remoteCache;
         } catch (localErr) {
           console.warn('[upload-and-send] Could not cache local PDF:', localErr.message);
         }
@@ -724,7 +728,6 @@ router.post(
         customEmailSubject:   doc.customEmailSubject,
       };
 
-      // Respond immediately — emails run in background
       emitSocket(req, 'document:created', {
         documentId: doc._id,
         ownerId:    req.user.id,
@@ -732,11 +735,16 @@ router.post(
         status:     doc.status,
       });
 
-      res.json({ success: true, document: sanitizeDoc(doc) });
+      const emailResult = await sendSigningEmail(signingPayload);
+      if (emailResult?.success === false) {
+        return res.status(502).json({
+          success:  false,
+          message:  `Document saved but signing email failed: ${emailResult.error || 'SMTP error'}. Check SMTP settings on the server.`,
+          document: sanitizeDoc(doc),
+        });
+      }
 
-      sendSigningEmail(signingPayload).catch(emailErr => {
-        console.error('[upload-and-send] First email failed:', emailErr.message);
-      });
+      res.json({ success: true, document: sanitizeDoc(doc), emailSent: true });
 
       parsedCC.forEach(cc =>
         sendCCEmail({

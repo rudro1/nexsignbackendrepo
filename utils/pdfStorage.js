@@ -46,23 +46,36 @@ async function fetchFromCloudinary(publicId) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-const PDF_DIR = path.join(__dirname, '..', 'uploads', 'pdfs');
+// Vercel/serverless: only /tmp is writable; project uploads/ is read-only
+const PDF_DIR = process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME
+  ? path.join('/tmp', 'nexsign-pdfs')
+  : path.join(__dirname, '..', 'uploads', 'pdfs');
 
 function ensurePdfDir() {
-  if (!fs.existsSync(PDF_DIR)) {
-    fs.mkdirSync(PDF_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(PDF_DIR)) {
+      fs.mkdirSync(PDF_DIR, { recursive: true });
+    }
+  } catch (err) {
+    console.warn('[pdfStorage] Could not create PDF cache dir:', err.message);
+    throw err;
   }
 }
 
-/** Save PDF bytes locally — returns filename stored under uploads/pdfs/ */
+/** Save PDF bytes locally — returns filename or null if cache unavailable */
 function savePdfBuffer(buffer, basename = '') {
-  ensurePdfDir();
-  const safeBase = String(basename || crypto.randomBytes(16).toString('hex'))
-    .replace(/[^a-zA-Z0-9_-]/g, '');
-  const filename = `${safeBase || crypto.randomBytes(8).toString('hex')}.pdf`;
-  const fullPath = path.join(PDF_DIR, filename);
-  fs.writeFileSync(fullPath, buffer);
-  return filename;
+  try {
+    ensurePdfDir();
+    const safeBase = String(basename || crypto.randomBytes(16).toString('hex'))
+      .replace(/[^a-zA-Z0-9_-]/g, '');
+    const filename = `${safeBase || crypto.randomBytes(8).toString('hex')}.pdf`;
+    const fullPath = path.join(PDF_DIR, filename);
+    fs.writeFileSync(fullPath, buffer);
+    return filename;
+  } catch (err) {
+    console.warn('[pdfStorage] Local PDF cache skipped:', err.message);
+    return null;
+  }
 }
 
 function resolveLocalPath(localPdfPath) {
@@ -95,8 +108,9 @@ async function getPdfBytes(record, { preferSigned = false } = {}) {
     if (local) return local;
   }
 
-  if (record.filePublicId) {
-    const fromCloud = await fetchFromCloudinary(record.filePublicId);
+  const cloudPublicId = record.filePublicId || record.fileId;
+  if (cloudPublicId) {
+    const fromCloud = await fetchFromCloudinary(cloudPublicId);
     if (fromCloud) return fromCloud;
   }
 
@@ -111,8 +125,8 @@ async function getPdfBytes(record, { preferSigned = false } = {}) {
   const res = await fetch(url, { headers: { Accept: 'application/pdf,*/*' } });
   if (res.ok) return Buffer.from(await res.arrayBuffer());
 
-  if (res.status === 401 && record.filePublicId) {
-    const signed = await fetchFromCloudinary(record.filePublicId);
+  if (res.status === 401 && cloudPublicId) {
+    const signed = await fetchFromCloudinary(cloudPublicId);
     if (signed) return signed;
   }
 
