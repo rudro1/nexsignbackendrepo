@@ -1574,65 +1574,94 @@ const employeeSign = asyncHandler(async (req, res) => {
       }
 
       // ── Step 6: Update template stats ──────────────
-      await template.recalculateStats();
+      let freshTemplate = null;
+      try {
+        const templateDoc = await Template.findById(template._id);
+        if (templateDoc) {
+          freshTemplate = await templateDoc.recalculateStats();
+        }
+      } catch (e) {
+        console.error('[employeeSign] Stats update failed:', e.message);
+        freshTemplate = await Template.findById(template._id);
+      }
+
+      const owner = template.owner
+        ? await User.findById(template.owner).select('full_name email company_logo').lean()
+        : null;
+
+      // Prefer in-memory PDF; fall back to stored copy for email attachment
+      let emailPdfBuffer = pdfBuffer;
+      if (!emailPdfBuffer) {
+        try {
+          emailPdfBuffer = await getPdfBytes({
+            fileUrl:      session.signedFileUrl,
+            filePublicId: session.signedFilePublicId,
+            localPdfPath: session.localSignedPdfPath,
+          });
+        } catch (e) {
+          console.error('[employeeSign] Could not load stored PDF for email:', e.message);
+        }
+      }
+
+      const signedPdfUrlForEmail = signedFileUrl || session.signedFileUrl || '';
+      const partiesForEmail      = sessionDoc?.parties || [];
 
       // ── Step 7: Completion email to employee ───────
       try {
-        if (sessionDoc) {
+        if (emailPdfBuffer || signedPdfUrlForEmail) {
           await sendCompletionEmail?.({
             recipientEmail:       session.recipientEmail,
             recipientName:        session.recipientName,
             recipientDesignation: session.recipientDesignation || '',
             documentTitle:        template.title,
-            pdfBuffer:            pdfBuffer || null,
-            signedPdfUrl:         signedFileUrl || template.bossSignedFileUrl || '',
+            pdfBuffer:            emailPdfBuffer || null,
+            signedPdfUrl:         signedPdfUrlForEmail || template.bossSignedFileUrl || '',
             companyName:          template.companyName || '',
-            companyLogoUrl:       resolveTemplateLogo(template, req.user),
-            ownerCompanyLogo:     req.user?.company_logo || '',
-            parties:              sessionDoc.parties,
+            companyLogoUrl:       resolveTemplateLogo(template, owner),
+            ownerCompanyLogo:     owner?.company_logo || '',
+            parties:              partiesForEmail,
           });
+          console.log(`[employeeSign] Completion email sent to ${session.recipientEmail}`);
+        } else {
+          console.error('[employeeSign] No signed PDF available — completion email skipped');
         }
       } catch (e) {
         console.error('[employeeSign] Completion email failed:', e.message);
       }
 
       // ── Step 8: If all signed → owner + CC emails ──
-      const freshTemplate = await Template.findById(template._id);
       if (freshTemplate?.status === 'completed') {
         try {
-          const owner = await User.findById(template.owner);
-
           // Owner notification
           await sendCompletionEmail?.({
-            recipientEmail:  owner?.email,
-            recipientName:   owner?.full_name || 'Owner',
-            documentTitle:   template.title,
-            pdfBuffer:       pdfBuffer || null,
-            signedPdfUrl:    signedFileUrl || '',
-            companyName:     template.companyName || '',
-            companyLogoUrl:  resolveTemplateLogo(template, owner),
+            recipientEmail:   owner?.email,
+            recipientName:    owner?.full_name || 'Owner',
+            documentTitle:    template.title,
+            pdfBuffer:        emailPdfBuffer || null,
+            signedPdfUrl:     signedPdfUrlForEmail,
+            companyName:      template.companyName || '',
+            companyLogoUrl:   resolveTemplateLogo(template, owner),
             ownerCompanyLogo: owner?.company_logo || '',
-            parties:         sessionDoc?.parties || [],
+            parties:          partiesForEmail,
           });
 
-          // ✅ FIX: CC emails with PDF attachment
+          // CC emails with PDF attachment
           await Promise.allSettled(
             (template.ccList || []).map(cc =>
               sendCompletionEmail?.({
-                recipientEmail:  cc.email,
-                recipientName:   cc.name  || cc.email,
-                documentTitle:   template.title,
-                pdfBuffer:       pdfBuffer || null,
-                signedPdfUrl:    signedFileUrl || '',
-                companyName:     template.companyName || '',
-                companyLogoUrl:  resolveTemplateLogo(template, owner),
+                recipientEmail:   cc.email,
+                recipientName:    cc.name || cc.email,
+                documentTitle:    template.title,
+                pdfBuffer:        emailPdfBuffer || null,
+                signedPdfUrl:     signedPdfUrlForEmail,
+                companyName:      template.companyName || '',
+                companyLogoUrl:   resolveTemplateLogo(template, owner),
                 ownerCompanyLogo: owner?.company_logo || '',
-                isCC:            true,
-                parties:         sessionDoc.parties,
-              })
-            )
+                isCC:             true,
+                parties:          partiesForEmail,
+              }),
+            ),
           );
-
         } catch (e) {
           console.error('[employeeSign] Owner/CC email failed:', e.message);
         }
@@ -1665,12 +1694,14 @@ const employeeSign = asyncHandler(async (req, res) => {
         { app: { get: () => null } },
         'template:employee_signed',
         {
-          templateId:  String(template._id),
-          ownerId:     String(template.owner),
-          signerName:  session.recipientName,
-          signerEmail: session.recipientEmail,
-          signedCount: freshTemplate?.stats?.signed || 0,
-          totalCount:  freshTemplate?.stats?.totalRecipients || 0,
+          templateId:    String(template._id),
+          sessionId:     String(session._id),
+          ownerId:       String(template.owner),
+          signerName:    session.recipientName,
+          signerEmail:   session.recipientEmail,
+          signedFileUrl: signedPdfUrlForEmail || null,
+          signedCount:   freshTemplate?.stats?.signed || 0,
+          totalCount:    freshTemplate?.stats?.totalRecipients || 0,
         },
       );
 
