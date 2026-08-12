@@ -3050,7 +3050,7 @@ function buildEmailHtml(opts) {
                       </td>
                       <td style="vertical-align:middle;">
                         <p style="margin:0;font-size:13px;font-weight:700;color:#0f172a;">NexSign</p>
-                        <p style="margin:0;font-size:10px;color:#94a3b8;">nexsign.app &middot; Trusted eSigning</p>
+                        <p style="margin:0;font-size:10px;color:#94a3b8;">Trusted eSigning</p>
                       </td>
                     </tr>
                   </table>
@@ -3065,8 +3065,7 @@ function buildEmailHtml(opts) {
                                        color:#64748b;text-align:center;line-height:1.75;
                                        font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
                   &copy; ${new Date().getFullYear()} ${escapeHtml(companyName)}. All rights reserved.<br/>
-                  Sent securely via
-                  <a href="https://nexsign.app" style="color:#0284c7;text-decoration:none;font-weight:600;">NexSign</a>
+                  Sent securely via <strong style="color:#0284c7;">NexSign</strong>
                   &mdash; Electronic Signature Platform<br/>
                   <span style="color:#475569;font-size:10px;">
                     You received this message because ${escapeHtml(senderName)} initiated a signing request through NexSign.
@@ -3178,7 +3177,7 @@ async function sendEmail(type, data, attachments = []) {
     ({ subject, html } = composeEmail(type, data, attachments));
 
     await transporter.sendMail({
-      from:        `"${data.companyName || 'NexSign'} via NexSign" <${process.env.SMTP_USER || process.env.SMTP_FROM || 'noreply@nexsign.app'}>`,
+      from:        `"${data.companyName || 'NexSign'} via NexSign" <${process.env.SMTP_USER || process.env.SMTP_FROM || process.env.EMAIL_USER || 'noreply@localhost'}>`,
       replyTo:     data.senderEmail || data.bossEmail || undefined,
       to:          data.to,
       subject,

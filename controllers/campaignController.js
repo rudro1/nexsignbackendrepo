@@ -13,7 +13,7 @@ try { pdfService = require('../utils/pdfService'); } catch { /* optional */ }
 let emailService = {};
 try { emailService = require('../utils/emailService'); } catch { /* optional */ }
 
-const { getPdfBytes, sendPdf, savePdfBuffer, buildBossSignedPdfRecord } = require('../utils/pdfStorage');
+const { getPdfBytes, sendPdf } = require('../utils/pdfStorage');
 
 const {
   sendEmployeeSigningEmail,
@@ -182,12 +182,43 @@ async function findApproverContext(token) {
   return null;
 }
 
+function buildFieldsForApproverPayload(doc) {
+  const bossSig = doc.bossSignature?.signatureImageUrl || null;
+  return (doc.fields || []).map(raw => {
+    const f = pdfService?.plainField ? pdfService.plainField(raw) : (raw?.toObject ? raw.toObject() : { ...raw });
+    let value = f.value || null;
+    const isBoss = !f.assignedTo || f.assignedTo === 'boss';
+    if (
+      isBoss &&
+      (f.type === 'signature' || f.type === 'initial' || f.type === 'initials') &&
+      bossSig
+    ) {
+      value = bossSig;
+    }
+    return {
+      id:         f.id,
+      type:       f.type,
+      page:       f.page || 1,
+      assignedTo: f.assignedTo || 'employee',
+      label:      f.label || '',
+      required:   f.required !== false,
+      value:      value || null,
+      x:          f.x,
+      y:          f.y,
+      width:      f.width,
+      height:     f.height,
+    };
+  });
+}
+
 function approverPayload(ctx, idx) {
   const doc = ctx.doc;
   const approver = doc.approvers[idx];
   const employeeCount = doc.recipients?.length || 0;
   const bossSig = doc.bossSignature || null;
-  const apiBase = (process.env.API_URL || 'http://localhost:5001/api').replace(/\/$/, '');
+  const fields  = buildFieldsForApproverPayload(doc);
+  const bossFields     = fields.filter(f => f.assignedTo === 'boss' || !f.assignedTo);
+  const employeeFields = fields.filter(f => f.assignedTo === 'employee');
 
   return {
     approver: {
@@ -203,6 +234,7 @@ function approverPayload(ctx, idx) {
       totalSteps:  doc.approvers.length,
       isLast:      idx === doc.approvers.length - 1,
       employeeCount,
+      totalPages:  doc.totalPages || 1,
       bossSigned:  !!doc.bossSignedFileUrl,
       bossSignature: bossSig ? {
         signedAt: bossSig.signedAt,
@@ -212,8 +244,13 @@ function approverPayload(ctx, idx) {
         .slice(0, idx)
         .filter(a => a.status === 'approved')
         .map(a => ({ name: a.name, approvedAt: a.approvedAt })),
+      fieldSummary: {
+        bossFields:     bossFields.length,
+        employeeFields: employeeFields.length,
+        bossFilled:     bossFields.filter(f => f.value).length,
+      },
     },
-    pdfUrl: `${apiBase}/template-campaigns/pdf/${approver.token}`,
+    fields,
   };
 }
 
@@ -666,16 +703,34 @@ const getCampaignPdf = asyncHandler(async (req, res) => {
     return sendPdf(res, buffer, title, { publicAccess: true });
   }
 
-  // Approver review — must show PDF with authoriser signature embedded
+  // Approver review — full PDF: authoriser sign/text + employee field markers
   if (isApproverView) {
     if (!doc.bossSignedFileUrl) {
       return res.status(409).send(
         'Authoriser has not signed yet. You can approve only after the signed PDF is ready.',
       );
     }
-    const record = buildBossSignedPdfRecord(doc);
-    const buffer = await getPdfBytes(record, { preferSigned: true });
-    return sendPdf(res, buffer, title, { publicAccess: true });
+
+    if (!pdfService?.buildApproverReviewPdf) {
+      return res.status(503).send('PDF review service is unavailable.');
+    }
+
+    try {
+      const originalRecord = {
+        fileUrl:      doc.fileUrl,
+        filePublicId: doc.filePublicId || doc.fileId,
+        fileId:       doc.filePublicId || doc.fileId,
+        localPdfPath: doc.localPdfPath,
+      };
+      const baseBytes = await getPdfBytes(originalRecord);
+      const buffer    = await pdfService.buildApproverReviewPdf(baseBytes, doc);
+      return sendPdf(res, buffer, title, { publicAccess: true });
+    } catch (err) {
+      console.error('[getCampaignPdf] Approver review PDF failed:', err.message);
+      return res.status(502).send(
+        'Could not build the review PDF. Please try again or contact support.',
+      );
+    }
   }
 
   return res.status(404).send('Not found');

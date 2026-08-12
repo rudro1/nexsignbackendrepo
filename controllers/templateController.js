@@ -653,7 +653,7 @@ async function embedBossSignatureOnRecord(record, signatureDataUrl, fieldValues 
   };
 
   if (!pdfService?.embedBossSignature) {
-    return { bossSignedFileUrl: record.fileUrl, mergedBytes: null };
+    throw new Error('PDF signature embedding is not available on this server.');
   }
 
   try {
@@ -692,7 +692,7 @@ async function embedBossSignatureOnRecord(record, signatureDataUrl, fieldValues 
     };
   } catch (e) {
     console.error('[embedBossSignatureOnRecord] PDF embed failed:', e.message);
-    return { bossSignedFileUrl: record.fileUrl, mergedBytes: null };
+    throw new Error(`Could not embed authoriser signature into PDF: ${e.message}`);
   }
 }
 

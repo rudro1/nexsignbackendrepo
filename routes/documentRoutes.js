@@ -904,10 +904,28 @@ router.get('/sign/:token/pdf', async (req, res) => {
   try {
     const doc = await Document
       .findOne({ 'parties.token': req.params.token })
-      .select('fileUrl fileId signedFileId title localPdfPath signedFileUrl localSignedPdfPath')
+      .select('fileUrl fileId signedFileId title localPdfPath signedFileUrl localSignedPdfPath fields parties')
       .lean();
 
     if (!doc) return res.status(404).send('Not found');
+
+    const partyIdx = doc.parties?.findIndex(p => p.token === req.params.token) ?? -1;
+    const embeddedFields = (doc.fields || []).filter(f => {
+      if (!f.value || !String(f.value).trim()) return false;
+      const pi = f.partyIndex ?? 0;
+      if (partyIdx >= 0 && pi >= partyIdx) return false;
+      if (partyIdx >= 0 && doc.parties[pi]?.status !== 'signed') return false;
+      return true;
+    });
+
+    if (embeddedFields.length > 0) {
+      try {
+        const merged = await mergeSignaturesIntoPDF(doc, embeddedFields);
+        return sendPdf(res, Buffer.from(merged), doc.title, { publicAccess: true });
+      } catch (mergeErr) {
+        console.warn('[GET /sign/:token/pdf] Merge prior fields failed:', mergeErr.message);
+      }
+    }
 
     const buffer = await getPdfBytes(doc);
     return sendPdf(res, buffer, doc.title, { publicAccess: true });
@@ -1001,19 +1019,25 @@ router.post('/sign/submit', async (req, res) => {
       console.warn(`[geo] Both GPS and IP geo failed for: ${ip}`);
     }
 
-    // ✅ Fields merge
+    // ✅ Fields merge — persist text, number, date, checkbox, and signature values
     if (Array.isArray(fields)) {
       doc.fields = doc.fields.map(existingField => {
-        const submitted = fields.find(f => f.id === existingField.id);
+        const plain = existingField.toObject
+          ? existingField.toObject()
+          : { ...existingField };
+        const submitted = fields.find(f => f.id === plain.id);
         if (submitted && submitted.partyIndex === idx) {
+          const raw = submitted.value;
+          const hasValue = raw !== null && raw !== undefined && String(raw).trim() !== '';
           return {
-            ...existingField,
-            value:    submitted.value || null,
-            filledAt: submitted.value ? new Date() : null,
+            ...plain,
+            value:    hasValue ? String(raw) : null,
+            filledAt: hasValue ? new Date() : null,
           };
         }
-        return existingField;
+        return plain;
       });
+      doc.markModified('fields');
     }
 
     const nextIdx = idx + 1;

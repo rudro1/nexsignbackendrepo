@@ -1590,7 +1590,8 @@ async function renderField(page, field, value, pdfDoc, fontReg, fontBold) {
       // ── Checkbox ──────────────────────────────────────────────────────────
       case 'checkbox': {
         const v = strVal.toLowerCase();
-        if (v !== 'true' && v !== 'checked') break;
+        const checked = v === 'true' || v === 'checked' || v === 'yes' || v === '1' || v === 'on';
+        if (!checked) break;
         const cx = absX + absW / 2, cy = absY + absH / 2;
         const s  = Math.min(absW, absH) * 0.35;
         const g  = rgb(0.05, 0.55, 0.2);
@@ -1629,6 +1630,133 @@ async function mergeSignaturesIntoPDF(pdfSource, fields = []) {
   }
 
   return pdfDoc.save({ useObjectStreams: false });
+}
+
+// ─── Approver review PDF — boss content + employee field guides ────────────────
+const FIELD_GUIDE_LABELS = {
+  signature: 'Signature',
+  initial:   'Initials',
+  initials:  'Initials',
+  text:      'Text',
+  number:    'Number',
+  date:      'Date',
+  checkbox:  'Checkbox',
+};
+
+function plainField(raw) {
+  return raw?.toObject ? raw.toObject() : { ...raw };
+}
+
+/** Split template fields into values to embed vs employee placeholders for approver review */
+function buildApproverReviewFieldList(doc) {
+  const bossSig = doc.bossSignature?.signatureImageUrl || null;
+  const filled  = [];
+  const guides  = [];
+
+  for (const raw of doc.fields || []) {
+    const f = plainField(raw);
+    const isBoss     = !f.assignedTo || f.assignedTo === 'boss';
+    const isEmployee = f.assignedTo === 'employee';
+
+    if (isBoss) {
+      let value = f.value || null;
+      if ((f.type === 'signature' || f.type === 'initial' || f.type === 'initials') && bossSig) {
+        value = bossSig;
+      }
+      if (value !== null && value !== undefined && String(value).trim()) {
+        filled.push({ ...f, value: String(value) });
+      }
+    } else if (isEmployee) {
+      if (f.value !== null && f.value !== undefined && String(f.value).trim()) {
+        filled.push({ ...f, value: String(f.value) });
+      } else {
+        guides.push(f);
+      }
+    }
+  }
+
+  return { filled, guides };
+}
+
+function renderFieldGuide(page, field, fontReg) {
+  const { width: pw, height: ph } = page.getSize();
+  const { absX, absY, absW, absH } = toAbsPt(field, pw, ph);
+  if (absW < 2 || absH < 2) return;
+
+  const typeLabel = FIELD_GUIDE_LABELS[field.type] || field.type || 'Field';
+  const label     = field.label?.trim()
+    ? `${field.label.trim()} (${typeLabel})`
+    : typeLabel;
+  const guideText = `Employee: ${label}`;
+
+  page.drawRectangle({
+    x:           absX,
+    y:           absY,
+    width:       absW,
+    height:      absH,
+    borderColor: rgb(0.16, 0.52, 0.78),
+    borderWidth: 1.2,
+    color:       rgb(0.94, 0.97, 1),
+    opacity:     0.55,
+  });
+
+  const fs = Math.min(9, Math.max(6, absH * 0.38));
+  let text = safe(guideText);
+  while (text.length > 1 && fontReg.widthOfTextAtSize(text, fs) > absW - 4) {
+    text = text.slice(0, -1);
+  }
+  page.drawText(text, {
+    x:     absX + 2,
+    y:     absY + Math.max(2, (absH - fs) / 2),
+    size:  fs,
+    font:  fontReg,
+    color: rgb(0.08, 0.35, 0.58),
+    maxWidth: absW - 4,
+  });
+}
+
+async function embedEmployeeFieldGuides(pdfBytes, guideFields = []) {
+  if (!guideFields.length) {
+    return Buffer.isBuffer(pdfBytes) ? pdfBytes : Buffer.from(pdfBytes);
+  }
+
+  const pdfDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true, updateMetadata: false });
+  const fontR  = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const pages  = pdfDoc.getPages();
+
+  for (const field of guideFields) {
+    const pi = Math.max(0, (field.page || 1) - 1);
+    if (pi >= pages.length) continue;
+    try {
+      renderFieldGuide(pages[pi], field, fontR);
+    } catch (e) {
+      console.error(`[pdfService] field guide error (id=${field.id}):`, e.message);
+    }
+  }
+
+  return Buffer.from(await pdfDoc.save({ useObjectStreams: false }));
+}
+
+/**
+ * Build approver review PDF: authoriser signature/text + employee field markers.
+ * @param {Buffer|Uint8Array} baseBytes — original template PDF bytes
+ * @param {object} doc — Template or TemplateCampaign record
+ */
+async function buildApproverReviewPdf(baseBytes, doc) {
+  const { filled, guides } = buildApproverReviewFieldList(doc);
+  let merged               = baseBytes;
+
+  if (filled.length) {
+    const b64 = 'data:application/pdf;base64,'
+      + Buffer.from(baseBytes).toString('base64');
+    merged = await mergeSignaturesIntoPDF(b64, filled);
+  }
+
+  if (guides.length) {
+    merged = await embedEmployeeFieldGuides(merged, guides);
+  }
+
+  return Buffer.isBuffer(merged) ? merged : Buffer.from(merged);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1908,7 +2036,7 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc) {
 
 function _auditFooter(page, fontR, fontM, PW, M, PH) {
   rect(page, 0, 0, PW, 32, C.brand);
-  txt(page, 'NexSign  |  Enterprise E-Signature Platform  |  nexsign.app', M, 20, { font: fontR, size: 8, color: C.white });
+  txt(page, 'NexSign  |  Enterprise E-Signature Platform', M, 20, { font: fontR, size: 8, color: C.white });
   txt(page, `Confidential & Legally Binding  |  ${new Date().toUTCString()}`, M, 8, { font: fontM, size: 7, color: rgb(0.85, 0.96, 1) });
 }
 
@@ -1919,4 +2047,7 @@ module.exports = {
   generateEmployeePdf,
   appendAuditPage,
   fetchPdfBytes,
+  buildApproverReviewPdf,
+  buildApproverReviewFieldList,
+  plainField,
 };
