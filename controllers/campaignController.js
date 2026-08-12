@@ -273,34 +273,29 @@ async function distributeCampaignToEmployees(campaign, ownerUser, req) {
   }));
 
   const sessions = await TemplateSession.insertMany(sessionDocs);
-  const failed = [];
-  let emailsSent = 0;
 
-  for (const session of sessions) {
-    const result = await dispatchEmployeeEmailForCampaign({
-      session, campaign, bossUser: ownerUser,
-    });
-    await recordSessionEmailResult(session, result);
-    if (result?.success) emailsSent += 1;
-    else failed.push({ name: session.recipientName, email: session.recipientEmail, error: result?.error });
-  }
+  const { queueEmployeeSessionEmails } = require('./templateController');
+  queueEmployeeSessionEmails({
+    sessions,
+    template: campaign,
+    bossUser: ownerUser,
+    req,
+    dispatchFn: ({ session, template, bossUser }) =>
+      dispatchEmployeeEmailForCampaign({ session, campaign: template, bossUser }),
+  });
 
   campaign.status = 'active';
   campaign.sentAt = new Date();
   campaign.stats.pending = campaign.recipients.length;
   await campaign.save();
 
-  if (failed.length) {
-    await sendEmailDeliveryFailureNotice?.({
-      ownerEmail: ownerUser.email,
-      ownerName:  ownerUser.full_name || ownerUser.name,
-      docTitle:   campaign.title,
-      failed,
-      totalCount: sessions.length,
-    });
-  }
-
-  return { phase: 'active', emailsSent, emailsFailed: failed.length, failedRecipients: failed };
+  return {
+    phase:        'active',
+    emailsSent:   0,
+    emailsQueued: true,
+    emailsFailed: 0,
+    failedRecipients: [],
+  };
 }
 
 // ════════════════════════════════════════════════════

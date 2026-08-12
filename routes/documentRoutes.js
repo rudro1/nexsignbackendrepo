@@ -1024,7 +1024,7 @@ router.post('/sign/submit', async (req, res) => {
           ? existingField.toObject()
           : { ...existingField };
         const submitted = fields.find(f => f.id === plain.id);
-        if (submitted && submitted.partyIndex === idx) {
+        if (submitted && Number(submitted.partyIndex) === idx) {
           const raw = submitted.value;
           const hasValue = raw !== null && raw !== undefined && String(raw).trim() !== '';
           return {
@@ -1140,7 +1140,7 @@ router.post('/sign/submit', async (req, res) => {
         completedAt: doc.completedAt,
       });
 
-      _finalizeDocument(req, doc).catch(e =>
+      _finalizeDocument(req, doc._id).catch(e =>
         console.error('[finalize]', e.message)
       );
 
@@ -1188,7 +1188,7 @@ router.post('/sign/finalize/:docId', async (req, res) => {
 
     res.json({ success: true, message: 'Finalization started.' });
 
-    _finalizeDocument(req, doc).catch(e =>
+    _finalizeDocument(req, doc._id).catch(e =>
       console.error('[finalize endpoint]', e.message)
     );
 
@@ -1410,26 +1410,27 @@ router.delete('/:id', auth, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // INTERNAL — Finalize
 // ═══════════════════════════════════════════════════════════════
-async function _finalizeDocument(req, doc) {
+async function _finalizeDocument(req, docOrId) {
   try {
-    console.log(`[finalize] Starting: ${doc._id}`);
+    const docId = typeof docOrId === 'object' && docOrId?._id ? docOrId._id : docOrId;
+    console.log(`[finalize] Starting: ${docId}`);
 
-    // ✅ Fresh doc load
-    const freshDoc = await Document.findById(doc._id);
+    const freshDoc = await Document.findById(docId);
     if (!freshDoc) {
-      console.error('[finalize] Document not found:', doc._id);
+      console.error('[finalize] Document not found:', docId);
       return;
     }
 
-    // ✅ Already finalized check
     if (freshDoc.signedFileUrl) {
-      console.log(`[finalize] Already done: ${doc._id}`);
+      console.log(`[finalize] Already done: ${docId}`);
       return;
     }
 
-    // ✅ Step 1: PDF fetch + merge
-    // fetchPdfBytes এ 55s timeout আছে — কিন্তু Vercel 60s এ kill করে
-    // তাই আলাদা timeout দাও
+    const filledCount = (freshDoc.fields || []).filter(
+      f => f.value && String(f.value).trim(),
+    ).length;
+    console.log(`[finalize] Embedding ${filledCount} filled field(s)`);
+
     console.log(`[finalize] Step 1: Merging signatures...`);
     const mergedBytes = await Promise.race([
       mergeSignaturesIntoPDF(freshDoc, freshDoc.fields),

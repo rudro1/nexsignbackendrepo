@@ -47,6 +47,78 @@ const {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+const EMAIL_BATCH_DELAY_MS = 800;
+
+/** Send signing emails in background with delay (avoids SMTP rate limits + Vercel timeout) */
+function queueEmployeeSessionEmails({
+  sessions,
+  template,
+  bossUser,
+  req,
+  dispatchFn = dispatchEmployeeEmail,
+}) {
+  setImmediate(async () => {
+    const failed = [];
+    let emailsSent = 0;
+
+    for (let i = 0; i < sessions.length; i++) {
+      const session = sessions[i];
+      try {
+        const result = await dispatchFn({ session, template, bossUser });
+        await recordSessionEmailResult(session, result);
+        if (result?.success) {
+          emailsSent += 1;
+          console.log(`[emailBatch] Sent to ${session.recipientEmail} (${i + 1}/${sessions.length})`);
+        } else {
+          failed.push({
+            name:  session.recipientName,
+            email: session.recipientEmail,
+            error: result?.error || 'Delivery failed',
+          });
+        }
+      } catch (e) {
+        console.error(`[emailBatch] Failed for ${session.recipientEmail}:`, e.message);
+        failed.push({
+          name:  session.recipientName,
+          email: session.recipientEmail,
+          error: e.message,
+        });
+      }
+      if (i < sessions.length - 1) await sleep(EMAIL_BATCH_DELAY_MS);
+    }
+
+    const emailsFailed = failed.length;
+    if (emailsFailed > 0) {
+      console.error(`[emailBatch] ${emailsFailed}/${sessions.length} emails failed`);
+      try {
+        await sendEmailDeliveryFailureNotice?.({
+          ownerEmail: bossUser.email,
+          ownerName:  bossUser.full_name || bossUser.name || 'Template Owner',
+          docTitle:   template.title,
+          failed,
+          totalCount: sessions.length,
+        });
+      } catch (noticeErr) {
+        console.error('[emailBatch] Owner notice failed:', noticeErr.message);
+      }
+      emitSocket(req, 'template:email_failed', {
+        templateId: String(template._id),
+        ownerId:    String(bossUser._id || bossUser.id),
+        failed,
+        emailsSent,
+        totalCount: sessions.length,
+      });
+    }
+
+    emitSocket(req, 'template:employees_emailed', {
+      templateId: String(template._id),
+      ownerId:    String(bossUser._id || bossUser.id),
+      emailsSent,
+      totalCount: sessions.length,
+    });
+  });
+}
+
 function resolveTemplateLogo(template, ownerUser) {
   return template?.companyLogo || ownerUser?.company_logo || '';
 }
@@ -169,58 +241,30 @@ async function distributeTemplateEmployees(template, bossUser, req) {
   }));
 
   const sessions = await TemplateSession.insertMany(sessionDocs);
-  const failed = [];
-  let emailsSent = 0;
 
-  for (const session of sessions) {
-    const result = await dispatchEmployeeEmail({ session, template, bossUser });
-    await recordSessionEmailResult(session, result);
-    if (result?.success) emailsSent += 1;
-    else {
-      failed.push({
-        name:  session.recipientName,
-        email: session.recipientEmail,
-        error: result?.error || 'Unknown error',
-      });
-    }
-  }
+  queueEmployeeSessionEmails({ sessions, template, bossUser, req });
 
   template.status = 'active';
   template.sentAt = template.sentAt || new Date();
   template.currentApproverIndex = -1;
   await template.save();
 
-  if (failed.length) {
-    try {
-      await sendEmailDeliveryFailureNotice?.({
-        ownerEmail:   bossUser.email,
-        ownerName:    bossUser.full_name || bossUser.name || 'Template Owner',
-        docTitle:     template.title,
-        failed,
-        totalCount:   sessions.length,
-      });
-    } catch (noticeErr) {
-      console.error('[distributeTemplateEmployees] Owner notice failed:', noticeErr.message);
-    }
-
-    emitSocket(req, 'template:email_failed', {
-      templateId: String(template._id),
-      ownerId:    String(bossUser._id || bossUser.id),
-      failed,
-      emailsSent,
-      totalCount: sessions.length,
-    });
-  }
-
   emitSocket(req, 'template:activated', {
     templateId:  String(template._id),
     ownerId:     String(bossUser._id || bossUser.id),
     title:       template.title,
     totalCount:  sessions.length,
-    emailsSent,
+    emailsQueued: true,
   });
 
-  return { phase: 'active', emailsSent, emailsFailed: failed.length, failedRecipients: failed };
+  return {
+    phase:         'active',
+    sessionsCount: sessions.length,
+    emailsSent:    0,
+    emailsQueued:  true,
+    emailsFailed:  0,
+    failedRecipients: [],
+  };
 }
 
 // ════════════════════════════════════════════════════
@@ -755,54 +799,7 @@ async function advanceTemplateAfterBossSign(template, bossUser, req, auditMeta =
 
   const sessions = await TemplateSession.insertMany(sessionDocs);
 
-  const failed = [];
-  let emailsSent = 0;
-
-  for (const session of sessions) {
-    const result = await dispatchEmployeeEmail({ session, template, bossUser });
-    await recordSessionEmailResult(session, result);
-    if (result?.success) emailsSent += 1;
-    else {
-      failed.push({
-        name:  session.recipientName,
-        email: session.recipientEmail,
-        error: result?.error || 'Unknown error',
-      });
-    }
-  }
-
-  const emailsFailed = failed.length;
-
-  if (emailsFailed > 0) {
-    console.error(`[bossSign] ${emailsFailed}/${sessions.length} employee emails failed`);
-    try {
-      await sendEmailDeliveryFailureNotice?.({
-        ownerEmail: bossUser.email,
-        ownerName:  bossUser.full_name || bossUser.name || 'Template Owner',
-        docTitle:   template.title,
-        failed,
-        totalCount: sessions.length,
-      });
-    } catch (noticeErr) {
-      console.error('[bossSign] Owner failure notice failed:', noticeErr.message);
-    }
-
-    emitSocket(req, 'template:email_failed', {
-      templateId: String(template._id),
-      ownerId:    String(bossUser._id || bossUser.id),
-      failed,
-      emailsSent,
-      totalCount: sessions.length,
-    });
-  }
-
-  emitSocket(req, 'template:activated', {
-    templateId:  String(template._id),
-    ownerId:     String(bossUser._id || bossUser.id),
-    title:       template.title,
-    totalCount:  sessions.length,
-    emailsSent,
-  });
+  queueEmployeeSessionEmails({ sessions, template, bossUser, req });
 
   safeAuditLog({
     action:         'boss_signed_template',
@@ -830,13 +827,12 @@ async function advanceTemplateAfterBossSign(template, bossUser, req, auditMeta =
   return {
     phase:            'active',
     sessionsCount:    sessions.length,
-    emailsSent,
-    emailsFailed,
-    failedRecipients: failed,
+    emailsSent:       0,
+    emailsQueued:     true,
+    emailsFailed:     0,
+    failedRecipients: [],
     template:         template.toJSON(),
-    message:          emailsFailed
-      ? `Boss signed. ${emailsSent}/${sessions.length} emails sent. ${emailsFailed} failed.`
-      : `Boss signed. All ${emailsSent} employee emails sent successfully.`,
+    message:          `Boss signed! Sending signing links to ${sessions.length} employees…`,
   };
 }
 
@@ -2186,4 +2182,5 @@ module.exports = {
   emailTemplateApprover,
   performBossSignOnTemplate,
   embedBossSignatureOnRecord,
+  queueEmployeeSessionEmails,
 };

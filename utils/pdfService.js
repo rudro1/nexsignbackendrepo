@@ -1412,6 +1412,32 @@ const C = {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/** Parse #RGB / #RRGGBB to pdf-lib rgb() */
+function hexToRgb(hex, fallback = rgb(0.08, 0.08, 0.08)) {
+  if (!hex || typeof hex !== 'string') return fallback;
+  let h = hex.trim().replace('#', '');
+  if (h.length === 3) h = h.split('').map(c => c + c).join('');
+  if (h.length < 6) return fallback;
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  if ([r, g, b].some(n => Number.isNaN(n))) return fallback;
+  return rgb(r / 255, g / 255, b / 255);
+}
+
+/** Fit text into field width by shrinking font size, then truncating as last resort */
+function fitTextToWidth(text, font, startSize, maxWidth) {
+  let fs = startSize;
+  let out = text;
+  while (fs > 6 && font.widthOfTextAtSize(out, fs) > maxWidth) {
+    fs -= 0.5;
+  }
+  while (out.length > 1 && font.widthOfTextAtSize(out, fs) > maxWidth) {
+    out = out.slice(0, -1);
+  }
+  return { text: out, size: fs };
+}
+
 /** Fetch PDF from URL / base64 dataURI / filesystem path / document record → Uint8Array */
 async function fetchPdfBytes(source) {
   if (!source) throw new Error('[pdfService] No PDF source provided.');
@@ -1560,18 +1586,18 @@ async function renderField(page, field, value, pdfDoc, fontReg, fontBold) {
       case 'text':
       case 'number': {
         const font = field.fontWeight === 'bold' ? fontBold : fontReg;
-        // Scale font to fit field height; clamp between 7–16pt
-        let fs   = Math.min(16, Math.max(7, absH * 0.55));
-        let text = safe(strVal);
-        // Truncate to fit width
-        while (text.length > 1 && font.widthOfTextAtSize(text, fs) > absW - 6) {
-          text = text.slice(0, -1);
-        }
+        const textColor = hexToRgb(field.color);
+        const startSize = Math.min(
+          Number(field.fontSize) || 12,
+          Math.max(7, absH * 0.55),
+        );
+        const { text, size: fs } = fitTextToWidth(safe(strVal), font, startSize, absW - 6);
         page.drawText(text, {
           x: absX + 3,
           y: absY + (absH - fs) / 2 + 1,
-          size: fs, font,
-          color: rgb(0.08, 0.08, 0.08),
+          size: fs,
+          font,
+          color: textColor,
           maxWidth: absW - 6,
         });
         break;
@@ -1579,10 +1605,15 @@ async function renderField(page, field, value, pdfDoc, fontReg, fontBold) {
 
       // ── Date ──────────────────────────────────────────────────────────────
       case 'date': {
-        const fs = Math.min(11, Math.max(7, absH * 0.45));
-        page.drawText(safe(strVal), {
-          x: absX + 3, y: absY + (absH - fs) / 2 + 1,
-          size: fs, font: fontReg, color: rgb(0.08, 0.08, 0.08),
+        const startSize = Math.min(Number(field.fontSize) || 11, Math.max(7, absH * 0.45));
+        const font = field.fontWeight === 'bold' ? fontBold : fontReg;
+        const { text, size: fs } = fitTextToWidth(safe(strVal), font, startSize, absW - 6);
+        page.drawText(text, {
+          x: absX + 3,
+          y: absY + (absH - fs) / 2 + 1,
+          size: fs,
+          font,
+          color: hexToRgb(field.color),
         });
         break;
       }
