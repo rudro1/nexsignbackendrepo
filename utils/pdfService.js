@@ -1649,9 +1649,16 @@ async function embedBossSignature({ fileUrl, signatureDataUrl, fields = [], fiel
     if (fv.fieldId) vm[fv.fieldId] = fv.value;
   }
 
-  for (const field of fields) {
-    // Only process boss-assigned fields
-    if (field.assignedTo && field.assignedTo !== 'boss') continue;
+  let bossFields = fields.filter(f => !f.assignedTo || f.assignedTo === 'boss');
+  if (
+    signatureDataUrl &&
+    !bossFields.some(f => f.type === 'signature' || f.type === 'initial')
+  ) {
+    const fallback = fields.find(f => f.type === 'signature' || f.type === 'initial');
+    if (fallback) bossFields = [fallback];
+  }
+
+  for (const field of bossFields) {
 
     const pi = Math.max(0, (field.page || 1) - 1);
     if (pi >= pages.length) continue;

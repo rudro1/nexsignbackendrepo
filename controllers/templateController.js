@@ -45,6 +45,18 @@ const {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+function resolveTemplateLogo(template, ownerUser) {
+  return template?.companyLogo || ownerUser?.company_logo || '';
+}
+
+function resolveBossInfo(req, bossFromBody = {}) {
+  return {
+    name:        String(bossFromBody.name || req.user.full_name || req.user.name || '').trim(),
+    email:       String(bossFromBody.email || req.user.email || '').trim().toLowerCase(),
+    designation: String(bossFromBody.designation || req.user.designation || '').trim(),
+  };
+}
+
 /** Send one employee signing email with one automatic retry */
 async function dispatchEmployeeEmail({ session, template, bossUser }) {
   const expiryDays = template.signingConfig?.expiryDays || 30;
@@ -66,7 +78,8 @@ async function dispatchEmployeeEmail({ session, template, bossUser }) {
     bossDesignation:     bossUser.designation || '',
     bossEmail:           bossUser.email,
     companyName:         template.companyName || '',
-    companyLogoUrl:      template.companyLogo || bossUser.company_logo || '',
+    companyLogoUrl:      resolveTemplateLogo(template, bossUser),
+    ownerCompanyLogo:    bossUser?.company_logo || '',
     emailHeaderColor:    template.emailHeaderColor || '#0f172a',
     message:             template.message || sc.emailMessage || '',
     expiryDate,
@@ -121,7 +134,8 @@ async function emailTemplateApprover(template, ownerUser) {
     documentTitle:       template.title,
     approvalLink:        `${FRONT()}/template-campaign/approve/${approver.token}`,
     companyName:         template.companyName,
-    companyLogoUrl:      template.companyLogo,
+    companyLogoUrl:      resolveTemplateLogo(template, ownerUser),
+    ownerCompanyLogo:    ownerUser?.company_logo || '',
     emailHeaderColor:    template.emailHeaderColor,
     stepNumber:          idx + 1,
     totalSteps:          template.approvers.length,
@@ -410,6 +424,9 @@ const createTemplate = asyncHandler(async (req, res) => {
     }))
     .filter(a => a.name && a.email);
 
+  const bossInfo  = resolveBossInfo(req, req.body.boss || {});
+  const bossToken = bossSignsFirst ? generateToken() : null;
+
   const template = await Template.create({
     title:        title.trim(),
     description:  description || '',
@@ -421,6 +438,8 @@ const createTemplate = asyncHandler(async (req, res) => {
     fields:       parsedFields,
     recipients:   parsedRecipients,
     ccList:       parsedCC,
+    boss:         bossInfo,
+    bossToken,
     companyName:  companyName  || '',
     companyLogo:  companyLogo || req.user.company_logo || '',
     emailHeaderColor: emailHeaderColor || '#0f172a',
@@ -461,18 +480,18 @@ const createTemplate = asyncHandler(async (req, res) => {
   if (bossSignsFirst) {
     try {
    await sendBossApprovalEmail?.({
-    // ✅ FIXED
-    bossEmail:     req.user.email,
-    bossName:      req.user.full_name || req.user.name || 'Boss',
-    bossDesignation: req.user.designation || '',
-    documentTitle: template.title,
-    signingLink:   `${FRONT()}/templates/${template._id}`,
-    employeeCount: parsedRecipients.length,
-    senderName:    req.user.full_name || req.user.name || 'Boss',
-    companyName:   template.companyName || '',
-    companyLogoUrl: template.companyLogo || '',
+    bossEmail:       bossInfo.email,
+    bossName:        bossInfo.name || 'Authoriser',
+    bossDesignation: bossInfo.designation || '',
+    documentTitle:   template.title,
+    signingLink:     `${FRONT()}/template-campaign/boss/${bossToken}`,
+    employeeCount:   parsedRecipients.length,
+    senderName:      req.user.full_name || req.user.name || 'Sender',
+    companyName:     template.companyName || '',
+    companyLogoUrl:  resolveTemplateLogo(template, req.user),
+    ownerCompanyLogo: req.user.company_logo || '',
     emailHeaderColor: template.emailHeaderColor || '#0f172a',
-    message:       template.message || '',
+    message:         template.message || '',
   });
     } catch (e) {
       console.error('[createTemplate] Boss email failed:', e.message);
@@ -623,6 +642,247 @@ const deleteTemplate = asyncHandler(async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════
+// BOSS SIGN HELPERS
+// ════════════════════════════════════════════════════
+async function embedBossSignatureOnRecord(record, signatureDataUrl, fieldValues = []) {
+  const pdfSource = {
+    fileUrl:      record.fileUrl,
+    filePublicId: record.filePublicId || record.fileId,
+    fileId:         record.filePublicId || record.fileId,
+    localPdfPath: record.localPdfPath,
+  };
+
+  if (!pdfService?.embedBossSignature) {
+    return { bossSignedFileUrl: record.fileUrl, mergedBytes: null };
+  }
+
+  try {
+    const mergedBytes = await Promise.race([
+      pdfService.embedBossSignature({
+        fileUrl:         pdfSource,
+        signatureDataUrl,
+        fields:          (record.fields || []).filter(f => f.assignedTo === 'boss'),
+        fieldValues:     Array.isArray(fieldValues) ? fieldValues : [],
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('embedBossSignature timeout')), 25_000),
+      ),
+    ]);
+
+    const pdfResult = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        {
+          resource_type: 'raw',
+          folder:        'nexsign/boss-signed',
+          public_id:     `boss_signed_${record._id}_${Date.now()}`,
+          format:        'pdf',
+        },
+        (err, result) => (err ? reject(err) : resolve(result)),
+      );
+      stream.end(Buffer.from(mergedBytes));
+    });
+
+    const localPath = savePdfBuffer(Buffer.from(mergedBytes), `boss_${record._id}`);
+
+    return {
+      bossSignedFileUrl:       pdfResult.secure_url,
+      bossSignedFilePublicId:  pdfResult.public_id,
+      localBossSignedPdfPath:  localPath,
+      mergedBytes,
+    };
+  } catch (e) {
+    console.error('[embedBossSignatureOnRecord] PDF embed failed:', e.message);
+    return { bossSignedFileUrl: record.fileUrl, mergedBytes: null };
+  }
+}
+
+async function advanceTemplateAfterBossSign(template, bossUser, req, auditMeta = {}) {
+  const { ip, geo, deviceInfo } = auditMeta;
+
+  if (template.approvers?.length > 0) {
+    template.status = 'approver_pending';
+    template.currentApproverIndex = 0;
+    template.bossToken = null;
+    await template.save();
+    await emailTemplateApprover(template, bossUser);
+
+    safeAuditLog({
+      action:         'boss_signed_template',
+      document_id:    template._id,
+      document_title: template.title,
+      performed_by: {
+        user_id: bossUser._id,
+        name:    bossUser.full_name || bossUser.name,
+        email:   bossUser.email,
+        role:    'boss',
+      },
+      device: {
+        device_name: deviceInfo?.device,
+        browser:     deviceInfo?.browser,
+        os:          deviceInfo?.os,
+      },
+    });
+
+    return {
+      phase:    'approver_pending',
+      message:  `Boss signed! First approver (${template.approvers[0].name}) has been emailed.`,
+      template: template.toJSON(),
+    };
+  }
+
+  template.status = 'active';
+  template.sentAt = new Date();
+  template.bossToken = null;
+  await template.save();
+
+  const expiryDays = template.signingConfig?.expiryDays || 30;
+  const expiresAt  = new Date(Date.now() + expiryDays * 86_400_000);
+
+  const sessionDocs = template.recipients.map(r => ({
+    template:             template._id,
+    recipientName:        r.name,
+    recipientEmail:       r.email,
+    recipientDesignation: r.designation || '',
+    token:                generateToken(),
+    status:               'pending',
+    expiresAt,
+    sentAt:               new Date(),
+    auditLog: [{
+      action:    'link_sent',
+      timestamp: new Date(),
+      note:      'Session created — sending email',
+    }],
+  }));
+
+  const sessions = await TemplateSession.insertMany(sessionDocs);
+
+  const failed = [];
+  let emailsSent = 0;
+
+  for (const session of sessions) {
+    const result = await dispatchEmployeeEmail({ session, template, bossUser });
+    await recordSessionEmailResult(session, result);
+    if (result?.success) emailsSent += 1;
+    else {
+      failed.push({
+        name:  session.recipientName,
+        email: session.recipientEmail,
+        error: result?.error || 'Unknown error',
+      });
+    }
+  }
+
+  const emailsFailed = failed.length;
+
+  if (emailsFailed > 0) {
+    console.error(`[bossSign] ${emailsFailed}/${sessions.length} employee emails failed`);
+    try {
+      await sendEmailDeliveryFailureNotice?.({
+        ownerEmail: bossUser.email,
+        ownerName:  bossUser.full_name || bossUser.name || 'Template Owner',
+        docTitle:   template.title,
+        failed,
+        totalCount: sessions.length,
+      });
+    } catch (noticeErr) {
+      console.error('[bossSign] Owner failure notice failed:', noticeErr.message);
+    }
+
+    emitSocket(req, 'template:email_failed', {
+      templateId: String(template._id),
+      ownerId:    String(bossUser._id || bossUser.id),
+      failed,
+      emailsSent,
+      totalCount: sessions.length,
+    });
+  }
+
+  emitSocket(req, 'template:activated', {
+    templateId:  String(template._id),
+    ownerId:     String(bossUser._id || bossUser.id),
+    title:       template.title,
+    totalCount:  sessions.length,
+    emailsSent,
+  });
+
+  safeAuditLog({
+    action:         'boss_signed_template',
+    document_id:    template._id,
+    document_title: template.title,
+    performed_by: {
+      user_id: bossUser._id,
+      name:    bossUser.full_name || bossUser.name,
+      email:   bossUser.email,
+      role:    'boss',
+    },
+    device: {
+      device_name: deviceInfo?.device,
+      browser:     deviceInfo?.browser,
+      os:          deviceInfo?.os,
+    },
+    location: {
+      ip_address: ip,
+      city:       geo?.city,
+      country:    geo?.country,
+      display:    geo?.display,
+    },
+  });
+
+  return {
+    phase:            'active',
+    sessionsCount:    sessions.length,
+    emailsSent,
+    emailsFailed,
+    failedRecipients: failed,
+    template:         template.toJSON(),
+    message:          emailsFailed
+      ? `Boss signed. ${emailsSent}/${sessions.length} emails sent. ${emailsFailed} failed.`
+      : `Boss signed. All ${emailsSent} employee emails sent successfully.`,
+  };
+}
+
+async function performBossSignOnTemplate(template, { signatureDataUrl, fieldValues, bossUser, req }) {
+  const ip         = getIP(req);
+  const ua         = req.headers['user-agent'] || '';
+  const geo        = await getGeoInfo(ip);
+  const deviceInfo = parseDevice(ua);
+
+  let signatureImageUrl = null;
+  try {
+    const uploaded = await uploadSignaturePng(signatureDataUrl, 'nexsign/boss-signatures');
+    signatureImageUrl = uploaded.secure_url;
+  } catch (e) {
+    console.error('[bossSign] Signature upload failed:', e.message);
+  }
+
+  const embed = await embedBossSignatureOnRecord(template, signatureDataUrl, fieldValues);
+  template.bossSignedFileUrl       = embed.bossSignedFileUrl;
+  template.bossSignedFilePublicId  = embed.bossSignedFilePublicId || template.bossSignedFilePublicId;
+  if (embed.localBossSignedPdfPath) {
+    template.localBossSignedPdfPath = embed.localBossSignedPdfPath;
+  }
+
+  template.bossSignature = {
+    signatureImageUrl,
+    signedAt:   new Date(),
+    ipAddress:  ip,
+    city:       geo?.city    || '',
+    region:     geo?.region  || '',
+    country:    geo?.country || '',
+    postalCode: geo?.postalCode || '',
+    timezone:   geo?.timezone   || '',
+    latitude:   geo?.latitude   || '',
+    longitude:  geo?.longitude  || '',
+    device:     deviceInfo.device,
+    browser:    deviceInfo.browser,
+    os:         deviceInfo.os,
+  };
+  await template.save();
+
+  return advanceTemplateAfterBossSign(template, bossUser, req, { ip, geo, deviceInfo });
+}
+
+// ════════════════════════════════════════════════════
 // 6. BOSS SIGN
 // POST /api/templates/:id/boss-sign
 // ════════════════════════════════════════════════════
@@ -647,249 +907,14 @@ const bossSign = asyncHandler(async (req, res) => {
       message: 'Template is not awaiting boss signature.',
     });
 
-  const ip         = getIP(req);
-  const ua         = req.headers['user-agent'] || '';
-  const geo        = await getGeoInfo(ip);
-  const deviceInfo = parseDevice(ua);
-
-  // ── Step 1: Upload boss signature PNG to Cloudinary ────────
-  let signatureImageUrl      = null;
-  let signatureImagePublicId = '';
-  try {
-    const uploaded       = await uploadSignaturePng(
-      signatureDataUrl,
-      'nexsign/boss-signatures',
-    );
-    signatureImageUrl      = uploaded.secure_url;
-    signatureImagePublicId = uploaded.public_id;
-  } catch (e) {
-    console.error('[bossSign] Signature upload failed:', e.message);
-    // Continue — signature URL will be null but we can still proceed
-  }
-
-  // ── Step 2: Embed boss signature into PDF ──────────────────
-  let bossSignedFileUrl = template.fileUrl; // fallback to original
-  let mergedBytes = null;
-  if (pdfService?.embedBossSignature) {
-    try {
-     // এই পুরো pdfService call টা replace করো:
-mergedBytes = await Promise.race([
-  pdfService.embedBossSignature({
-    fileUrl: {
-      fileUrl:      template.fileUrl,
-      filePublicId: template.filePublicId,
-      localPdfPath: template.localPdfPath,
-    },
+  const result = await performBossSignOnTemplate(template, {
     signatureDataUrl,
-    fields:      (template.fields || [])
-                    .filter(f => f.assignedTo === 'boss'),
-    fieldValues: Array.isArray(fieldValues) ? fieldValues : [],
-  }),
-  new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('embedBossSignature timeout')), 25_000)
-  ),
-]);
-
-      // Upload merged PDF to Cloudinary
-      const pdfResult = await new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          {
-            resource_type: 'raw',
-            folder:        'nexsign/boss-signed',
-            public_id:     `boss_signed_${template._id}_${Date.now()}`,
-            format:        'pdf',
-          },
-          (err, result) => err ? reject(err) : resolve(result),
-        );
-        stream.end(Buffer.from(mergedBytes));
-      });
-
-      bossSignedFileUrl             = pdfResult.secure_url;
-      template.bossSignedFileUrl    = bossSignedFileUrl;
-      template.bossSignedFilePublicId = pdfResult.public_id;
-      template.localBossSignedPdfPath = savePdfBuffer(
-        Buffer.from(mergedBytes),
-        `boss_${template._id}`,
-      );
-
-    } catch (e) {
-      console.error('[bossSign] PDF embed failed, using original:', e.message);
-      // fallback: use original PDF
-      template.bossSignedFileUrl = template.fileUrl;
-    }
-  } else {
-    // pdfService not available — use original PDF
-    template.bossSignedFileUrl = template.fileUrl;
-  }
-
-  // ── Step 3: Update template ────────────────────────────────
-  template.bossSignature = {
-    signatureImageUrl,
-    signedAt:   new Date(),
-    ipAddress:  ip,
-    city:       geo?.city    || '',
-    region:     geo?.region  || '',
-    country:    geo?.country || '',
-    postalCode: geo?.postalCode || '',
-    timezone:   geo?.timezone   || '',
-    latitude:   geo?.latitude   || '',
-    longitude:  geo?.longitude  || '',
-    device:     deviceInfo.device,
-    browser:    deviceInfo.browser,
-    os:         deviceInfo.os,
-  };
-  await template.save();
-
-  // ── Optional approver chain before employee emails ───────
-  if (template.approvers?.length > 0) {
-    template.status = 'approver_pending';
-    template.currentApproverIndex = 0;
-    await template.save();
-    await emailTemplateApprover(template, req.user);
-
-    safeAuditLog({
-      action:         'boss_signed_template',
-      document_id:    template._id,
-      document_title: template.title,
-      performed_by: {
-        user_id: req.user._id,
-        name:    req.user.full_name || req.user.name,
-        email:   req.user.email,
-        role:    'boss',
-      },
-      device: {
-        device_name: deviceInfo.device,
-        browser:     deviceInfo.browser,
-        os:          deviceInfo.os,
-      },
-    });
-
-    return res.json({
-      success: true,
-      message: `Boss signed! First approver (${template.approvers[0].name}) has been emailed.`,
-      phase:   'approver_pending',
-      template: template.toJSON(),
-    });
-  }
-
-  template.status  = 'active';
-  template.sentAt  = new Date();
-  await template.save();
-
-  // ── Step 4: Create sessions for all recipients ─────────────
-  const expiryDays = template.signingConfig?.expiryDays || 30;
-  const expiresAt  = new Date(Date.now() + expiryDays * 86_400_000);
-
-  const sessionDocs = template.recipients.map(r => ({
-    template:             template._id,
-    recipientName:        r.name,
-    recipientEmail:       r.email,
-    recipientDesignation: r.designation || '',
-    token:                generateToken(),
-    status:               'pending',
-    expiresAt,
-    sentAt:               new Date(),
-    auditLog: [{
-      action:    'link_sent',
-      timestamp: new Date(),
-      note:      'Session created — sending email',
-    }],
-  }));
-
-  const sessions = await TemplateSession.insertMany(sessionDocs);
-
-  // ── Step 5: Send emails to ALL employees (with retry + tracking) ──
-  const failed = [];
-  let emailsSent = 0;
-
-  for (const session of sessions) {
-    const result = await dispatchEmployeeEmail({
-      session,
-      template,
-      bossUser: req.user,
-    });
-    await recordSessionEmailResult(session, result);
-
-    if (result?.success) {
-      emailsSent += 1;
-    } else {
-      failed.push({
-        name:  session.recipientName,
-        email: session.recipientEmail,
-        error: result?.error || 'Unknown error',
-      });
-    }
-  }
-
-  const emailsFailed = failed.length;
-
-  if (emailsFailed > 0) {
-    console.error(`[bossSign] ${emailsFailed}/${sessions.length} employee emails failed`);
-    try {
-      await sendEmailDeliveryFailureNotice?.({
-        ownerEmail:   req.user.email,
-        ownerName:    req.user.full_name || req.user.name || 'Template Owner',
-        docTitle:     template.title,
-        failed,
-        totalCount:   sessions.length,
-      });
-    } catch (noticeErr) {
-      console.error('[bossSign] Owner failure notice failed:', noticeErr.message);
-    }
-
-    emitSocket(req, 'template:email_failed', {
-      templateId: String(template._id),
-      ownerId:    String(req.user._id),
-      failed,
-      emailsSent,
-      totalCount: sessions.length,
-    });
-  }
-
-  // ── Step 6: Emit socket ────────────────────────────────────
-  emitSocket(req, 'template:activated', {
-    templateId:  String(template._id),
-    ownerId:     String(req.user._id),
-    title:       template.title,
-    totalCount:  sessions.length,
-    emailsSent,
+    fieldValues,
+    bossUser: req.user,
+    req,
   });
 
-  // ── Step 7: Audit log ──────────────────────────────────────
-  safeAuditLog({
-    action:         'boss_signed_template',
-    document_id:    template._id,
-    document_title: template.title,
-    performed_by: {
-      user_id: req.user._id,
-      name:    req.user.full_name || req.user.name,
-      email:   req.user.email,
-      role:    'boss',
-    },
-    device: {
-      device_name: deviceInfo.device,
-      browser:     deviceInfo.browser,
-      os:          deviceInfo.os,
-    },
-    location: {
-      ip_address: ip,
-      city:       geo.city,
-      country:    geo.country,
-      display:    geo.display,
-    },
-  });
-
-  return res.json({
-    success:       true,
-    message:       emailsFailed
-      ? `Boss signed. ${emailsSent}/${sessions.length} emails sent. ${emailsFailed} failed — check your inbox for details.`
-      : `Boss signed. All ${emailsSent} employee emails sent successfully.`,
-    sessionsCount: sessions.length,
-    emailsSent,
-    emailsFailed,
-    failedRecipients: failed,
-    template:      template.toJSON(),
-  });
+  return res.json({ success: true, ...result });
 });
 
 // ════════════════════════════════════════════════════
@@ -2092,4 +2117,6 @@ module.exports = {
   getTemplatePdf,
   distributeTemplateEmployees,
   emailTemplateApprover,
+  performBossSignOnTemplate,
+  embedBossSignatureOnRecord,
 };

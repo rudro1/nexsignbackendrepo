@@ -31,6 +31,28 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const FRONT = () =>
   (process.env.FRONTEND_URL || 'http://127.0.0.1:5174').replace(/\/$/, '');
 
+function resolveCampaignLogo(campaign, ownerUser) {
+  return campaign?.companyLogo || ownerUser?.company_logo || '';
+}
+
+async function findBossContext(token) {
+  const campaign = await TemplateCampaign.findOne({
+    bossToken: token,
+    status:    'boss_pending',
+    isDeleted: false,
+  });
+  if (campaign) return { type: 'campaign', doc: campaign };
+
+  const template = await Template.findOne({
+    bossToken: token,
+    status:    'boss_pending',
+    isDeleted: false,
+  });
+  if (template) return { type: 'template', doc: template };
+
+  return null;
+}
+
 const getIP = req =>
   req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
   req.headers['x-real-ip'] || req.ip || 'Unknown';
@@ -66,7 +88,8 @@ async function dispatchEmployeeEmailForCampaign({ session, campaign, bossUser })
     bossDesignation:     campaign.boss?.designation || '',
     bossEmail:           campaign.boss?.email || bossUser.email,
     companyName:         campaign.companyName || '',
-    companyLogoUrl:      campaign.companyLogo || '',
+    companyLogoUrl:      resolveCampaignLogo(campaign, bossUser),
+    ownerCompanyLogo:    bossUser?.company_logo || '',
     emailHeaderColor:    campaign.emailHeaderColor || '#0f172a',
     message:             campaign.message || '',
     expiryDate,
@@ -130,7 +153,8 @@ async function emailCurrentApprover(campaign, ownerUser) {
     documentTitle:       campaign.title,
     approvalLink:        `${FRONT()}/template-campaign/approve/${approver.token}`,
     companyName:         campaign.companyName,
-    companyLogoUrl:      campaign.companyLogo,
+    companyLogoUrl:      resolveCampaignLogo(campaign, ownerUser),
+    ownerCompanyLogo:    ownerUser?.company_logo || '',
     emailHeaderColor:    campaign.emailHeaderColor,
     stepNumber:          idx + 1,
     totalSteps:          campaign.approvers.length,
@@ -340,7 +364,8 @@ const reuseTemplate = asyncHandler(async (req, res) => {
     documentTitle:   campaign.title,
     signingLink:     `${FRONT()}/template-campaign/boss/${campaign.bossToken}`,
     companyName:     campaign.companyName,
-    companyLogoUrl:  campaign.companyLogo,
+    companyLogoUrl:   resolveCampaignLogo(campaign, req.user),
+    ownerCompanyLogo: req.user.company_logo || '',
     emailHeaderColor: campaign.emailHeaderColor,
     ownerName:       req.user.full_name || req.user.name,
     employeeCount:   parsedRecipients.length,
@@ -379,25 +404,33 @@ const listCampaigns = asyncHandler(async (req, res) => {
 // POST /api/template-campaigns/boss/sign/:token
 // ════════════════════════════════════════════════════
 const validateBossToken = asyncHandler(async (req, res) => {
-  const campaign = await TemplateCampaign.findOne({
-    bossToken: req.params.token, status: 'boss_pending', isDeleted: false,
-  }).populate('owner', 'full_name email');
+  const ctx = await findBossContext(req.params.token);
 
-  if (!campaign) {
+  if (!ctx) {
     return res.status(404).json({ success: false, message: 'Invalid or expired boss signing link.' });
   }
+
+  const { doc, type } = ctx;
+  const owner = type === 'campaign'
+    ? await User.findById(doc.owner).select('full_name email').lean()
+    : await User.findById(doc.owner).select('full_name email').lean();
+
+  const boss = type === 'campaign'
+    ? doc.boss
+    : (doc.boss?.email ? doc.boss : { name: owner?.full_name, email: owner?.email });
 
   return res.json({
     success: true,
     campaign: {
-      title:       campaign.title,
-      companyName: campaign.companyName,
-      companyLogo: campaign.companyLogo,
-      fileUrl:     campaign.fileUrl,
-      boss:        campaign.boss,
-      approverCount: campaign.approvers?.length || 0,
-      employeeCount: campaign.recipients?.length || 0,
-      ownerName:   campaign.owner?.full_name || '',
+      title:         doc.title,
+      companyName:   doc.companyName,
+      companyLogo:   resolveCampaignLogo(doc, owner),
+      fileUrl:       doc.fileUrl,
+      boss,
+      approverCount: doc.approvers?.length || 0,
+      employeeCount: doc.recipients?.length || 0,
+      ownerName:     owner?.full_name || '',
+      sourceType:    type,
     },
   });
 });
@@ -408,14 +441,29 @@ const bossSignCampaign = asyncHandler(async (req, res) => {
     return res.status(400).json({ success: false, message: 'Signature is required.' });
   }
 
-  const campaign = await TemplateCampaign.findOne({
-    bossToken: req.params.token, status: 'boss_pending', isDeleted: false,
-  });
-  if (!campaign) {
+  const ctx = await findBossContext(req.params.token);
+  if (!ctx) {
     return res.status(404).json({ success: false, message: 'Invalid boss signing link.' });
   }
 
-  const ownerUser = await User.findById(campaign.owner).lean();
+  const { doc, type } = ctx;
+  const ownerUser = await User.findById(doc.owner).lean();
+
+  if (type === 'template') {
+    const { performBossSignOnTemplate } = require('./templateController');
+    const result = await performBossSignOnTemplate(doc, {
+      signatureDataUrl,
+      fieldValues,
+      bossUser: ownerUser,
+      req,
+    });
+    return res.json({
+      success: true,
+      message: result.message,
+      ...result,
+    });
+  }
+
   let signatureImageUrl = null;
   try {
     const uploaded = await uploadSignaturePng(signatureDataUrl, 'nexsign/boss-signatures');
@@ -424,41 +472,19 @@ const bossSignCampaign = asyncHandler(async (req, res) => {
     console.error('[bossSignCampaign]', e.message);
   }
 
-  let bossSignedFileUrl = campaign.fileUrl;
-  if (pdfService?.embedBossSignature) {
-    try {
-      const mergedBytes = await Promise.race([
-        pdfService.embedBossSignature({
-          fileUrl:     campaign.fileUrl,
-          signatureDataUrl,
-          fields:      (campaign.fields || []).filter(f => f.assignedTo === 'boss'),
-          fieldValues: Array.isArray(fieldValues) ? fieldValues : [],
-        }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 25_000)),
-      ]);
+  const { embedBossSignatureOnRecord } = require('./templateController');
+  const embed = await embedBossSignatureOnRecord(doc, signatureDataUrl, fieldValues);
 
-      const pdfResult = await new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          {
-            resource_type: 'raw', folder: 'nexsign/boss-signed',
-            public_id: `campaign_boss_${campaign._id}_${Date.now()}`, format: 'pdf',
-          },
-          (err, result) => err ? reject(err) : resolve(result),
-        );
-        stream.end(Buffer.from(mergedBytes));
-      });
-      bossSignedFileUrl = pdfResult.secure_url;
-    } catch (e) {
-      console.error('[bossSignCampaign] PDF embed failed:', e.message);
-    }
-  }
-
+  const campaign = doc;
   campaign.bossSignature = {
     signatureImageUrl,
-    signedAt: new Date(),
+    signedAt:  new Date(),
     ipAddress: getIP(req),
   };
-  campaign.bossSignedFileUrl = bossSignedFileUrl;
+  campaign.bossSignedFileUrl = embed.bossSignedFileUrl;
+  if (embed.localBossSignedPdfPath) {
+    campaign.localBossSignedPdfPath = embed.localBossSignedPdfPath;
+  }
   campaign.bossToken = null;
   await campaign.save();
 
@@ -468,7 +494,7 @@ const bossSignCampaign = asyncHandler(async (req, res) => {
     success: true,
     message: result.phase === 'approver_pending'
       ? 'Signed! Approver chain started.'
-      : `Signed! ${result.emailsSent} employee email(s) sent.`,
+      : `Signed! ${result.emailsSent || 0} employee email(s) sent.`,
     ...result,
   });
 });
@@ -530,7 +556,7 @@ const approveCampaign = asyncHandler(async (req, res) => {
     approver.status = 'declined';
     approver.declineReason = reason || '';
     approver.approvedAt = new Date();
-    doc.status = 'cancelled';
+    doc.status = type === 'template' ? 'archived' : 'cancelled';
     await doc.save();
     return res.json({ success: true, message: 'Approval declined. Employee emails will not be sent.' });
   }
@@ -538,7 +564,7 @@ const approveCampaign = asyncHandler(async (req, res) => {
   approver.status = 'approved';
   approver.approvedAt = new Date();
   approver.note = note || '';
-  approver.token = null;
+  // Keep token — required by schema; status 'approved' invalidates the link
 
   const ownerUser = await User.findById(doc.owner).lean();
 

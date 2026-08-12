@@ -2779,6 +2779,12 @@ function normalizeLogoUrl(url) {
   return trimmed;
 }
 
+/** Prefer stored template/doc logo, fall back to owner profile logo */
+function resolveEmailLogo(data = {}) {
+  const raw = data.companyLogo || data.companyLogoUrl || data.ownerCompanyLogo || '';
+  return normalizeLogoUrl(raw);
+}
+
 /** Cloudinary: force PNG + reasonable width for email client compatibility */
 function emailSafeCloudinaryLogo(url) {
   if (!url.includes('res.cloudinary.com') || !url.includes('/image/upload/')) return url;
@@ -3144,7 +3150,7 @@ function composeEmail(type, data, attachments = []) {
     senderName,
     senderDesignation: data.senderDesignation || data.bossDesignation || '',
     companyName:      data.companyName || 'NexSign',
-    companyLogo:      data.companyLogo || data.companyLogoUrl || '',
+    companyLogo:      resolveEmailLogo(data),
     companyInitial:   (data.companyName || 'N')[0].toUpperCase(),
     expiryDate,
     emailHeaderColor: data.emailHeaderColor || '#0f172a',
@@ -3429,4 +3435,6 @@ module.exports = {
   buildEmailPreview,
   composeEmail,
   applyEmailTokens,
+  resolveEmailLogo,
+  normalizeLogoUrl,
 };

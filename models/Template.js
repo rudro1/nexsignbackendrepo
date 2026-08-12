@@ -100,6 +100,14 @@ const TemplateSchema = new mongoose.Schema({
     index: true,
   },
 
+  // External authoriser (boss) — receives token link to sign before employees
+  boss: {
+    name:        { type: String, default: '' },
+    email:       { type: String, default: '', lowercase: true, trim: true },
+    designation: { type: String, default: '' },
+  },
+  bossToken: { type: String, default: null, sparse: true, index: true },
+
   // ── Company branding ────────────────────────────
   companyName: { type: String, default: '' },
   companyLogo: { type: String, default: '' },
