@@ -190,8 +190,22 @@ async function connectDB() {
   await cached.promise;
 }
 
-// Health + root — no DB required (helps debug Vercel env)
-app.get(['/', '/api/health'], async (_req, res) => {
+// Health + API root — no DB required for basic info
+app.get(['/', '/api', '/api/health'], async (req, res) => {
+  if (req.path === '/api' || req.path === '/api/') {
+    return res.json({
+      success: true,
+      name:    'NexSign API',
+      version: process.env.npm_package_version || '1.0.0',
+      health:  '/api/health',
+      docs:    {
+        auth:      '/api/auth',
+        documents: '/api/documents',
+        templates: '/api/templates',
+      },
+    });
+  }
+
   const uri = getMongoUri();
   const states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
   const base = {
