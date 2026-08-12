@@ -13,7 +13,7 @@ try { pdfService = require('../utils/pdfService'); } catch { /* optional */ }
 let emailService = {};
 try { emailService = require('../utils/emailService'); } catch { /* optional */ }
 
-const { getPdfBytes, sendPdf, savePdfBuffer } = require('../utils/pdfStorage');
+const { getPdfBytes, sendPdf, savePdfBuffer, buildBossSignedPdfRecord } = require('../utils/pdfStorage');
 
 const {
   sendEmployeeSigningEmail,
@@ -185,10 +185,9 @@ async function findApproverContext(token) {
 function approverPayload(ctx, idx) {
   const doc = ctx.doc;
   const approver = doc.approvers[idx];
-  const isTemplate = ctx.type === 'template';
-  const employeeCount = isTemplate
-    ? (doc.recipients?.length || 0)
-    : (doc.recipients?.length || 0);
+  const employeeCount = doc.recipients?.length || 0;
+  const bossSig = doc.bossSignature || null;
+  const apiBase = (process.env.API_URL || 'http://localhost:5001/api').replace(/\/$/, '');
 
   return {
     approver: {
@@ -204,7 +203,17 @@ function approverPayload(ctx, idx) {
       totalSteps:  doc.approvers.length,
       isLast:      idx === doc.approvers.length - 1,
       employeeCount,
+      bossSigned:  !!doc.bossSignedFileUrl,
+      bossSignature: bossSig ? {
+        signedAt: bossSig.signedAt,
+        name:     doc.boss?.name || '',
+      } : null,
+      previousApprovers: doc.approvers
+        .slice(0, idx)
+        .filter(a => a.status === 'approved')
+        .map(a => ({ name: a.name, approvedAt: a.approvedAt })),
     },
+    pdfUrl: `${apiBase}/template-campaigns/pdf/${approver.token}`,
   };
 }
 
@@ -340,8 +349,10 @@ const reuseTemplate = asyncHandler(async (req, res) => {
   });
 
   if (mode === 'reuse') {
-    campaign.bossSignedFileUrl = source.bossSignedFileUrl;
-    campaign.bossSignature     = source.bossSignature;
+    campaign.bossSignedFileUrl       = source.bossSignedFileUrl;
+    campaign.bossSignedFilePublicId  = source.bossSignedFilePublicId || '';
+    campaign.bossSignature           = source.bossSignature;
+    campaign.localBossSignedPdfPath  = source.localBossSignedPdfPath;
     const result = await advanceCampaignPipeline(campaign, req.user, req);
     return res.status(201).json({
       success:  true,
@@ -482,6 +493,9 @@ const bossSignCampaign = asyncHandler(async (req, res) => {
     ipAddress: getIP(req),
   };
   campaign.bossSignedFileUrl = embed.bossSignedFileUrl;
+  if (embed.bossSignedFilePublicId) {
+    campaign.bossSignedFilePublicId = embed.bossSignedFilePublicId;
+  }
   if (embed.localBossSignedPdfPath) {
     campaign.localBossSignedPdfPath = embed.localBossSignedPdfPath;
   }
@@ -525,10 +539,16 @@ const validateApproverToken = asyncHandler(async (req, res) => {
     return res.status(410).json({ success: false, message: 'This approval link has already been used.' });
   }
 
+  if (!doc.bossSignedFileUrl) {
+    return res.status(409).json({
+      success: false,
+      message: 'Authoriser has not signed yet. Please wait for the signed PDF before approving.',
+    });
+  }
+
   return res.json({
     success: true,
     ...approverPayload(ctx, idx),
-    pdfUrl: `${process.env.API_URL || 'http://localhost:5001'}/api/template-campaigns/pdf/${req.params.token}`,
   });
 });
 
@@ -608,46 +628,57 @@ const approveCampaign = asyncHandler(async (req, res) => {
 // GET /api/template-campaigns/pdf/:token
 // ════════════════════════════════════════════════════
 const getCampaignPdf = asyncHandler(async (req, res) => {
-  let campaign = await TemplateCampaign.findOne({
-    $or: [
-      { bossToken: req.params.token },
-      { 'approvers.token': req.params.token },
-    ],
+  const { token } = req.params;
+
+  let doc = await TemplateCampaign.findOne({
+    $or: [{ bossToken: token }, { 'approvers.token': token }],
     isDeleted: false,
   });
 
-  let record = null;
   let title = 'document';
+  let isApproverView = false;
 
-  if (campaign) {
-    record = {
-      fileUrl:            campaign.bossSignedFileUrl || campaign.fileUrl,
-      filePublicId:       campaign.filePublicId,
-      localPdfPath:       campaign.localBossSignedPdfPath || campaign.localPdfPath,
-      bossSignedFileUrl:  campaign.bossSignedFileUrl,
-    };
-    title = campaign.title;
+  if (doc) {
+    title = doc.title;
+    isApproverView = doc.approvers?.some(a => a.token === token) || false;
   } else {
-    const template = await Template.findOne({
-      'approvers.token': req.params.token,
+    doc = await Template.findOne({
+      'approvers.token': token,
       status: 'approver_pending',
       isDeleted: false,
     });
-    if (template) {
-      record = {
-        fileUrl:            template.bossSignedFileUrl || template.fileUrl,
-        filePublicId:       template.filePublicId,
-        localPdfPath:       template.localBossSignedPdfPath || template.localPdfPath,
-        bossSignedFileUrl:  template.bossSignedFileUrl,
-      };
-      title = template.title;
+    if (doc) {
+      title = doc.title;
+      isApproverView = true;
     }
   }
 
-  if (!record) return res.status(404).send('Not found');
+  if (!doc) return res.status(404).send('Not found');
 
-  const buffer = await getPdfBytes(record, { preferSigned: !!record.bossSignedFileUrl });
-  return sendPdf(res, buffer, title, { publicAccess: true });
+  // Boss signing page — show original PDF before authoriser signs
+  if (doc.bossToken === token) {
+    const record = {
+      fileUrl:      doc.fileUrl,
+      filePublicId: doc.filePublicId,
+      localPdfPath: doc.localPdfPath,
+    };
+    const buffer = await getPdfBytes(record);
+    return sendPdf(res, buffer, title, { publicAccess: true });
+  }
+
+  // Approver review — must show PDF with authoriser signature embedded
+  if (isApproverView) {
+    if (!doc.bossSignedFileUrl) {
+      return res.status(409).send(
+        'Authoriser has not signed yet. You can approve only after the signed PDF is ready.',
+      );
+    }
+    const record = buildBossSignedPdfRecord(doc);
+    const buffer = await getPdfBytes(record, { preferSigned: true });
+    return sendPdf(res, buffer, title, { publicAccess: true });
+  }
+
+  return res.status(404).send('Not found');
 });
 
 module.exports = {

@@ -105,6 +105,7 @@ const TemplateCampaignSchema = new mongoose.Schema({
   bossToken: { type: String, default: null, sparse: true, index: true },
   bossSignature:     { type: BossSignatureSchema, default: null },
   bossSignedFileUrl: { type: String, default: null },
+  bossSignedFilePublicId: { type: String, default: '' },
 
   // Sequential approvers (CEO → HR → …) before employee blast
   approvers:             { type: [ApproverSchema], default: [] },

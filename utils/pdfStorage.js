@@ -51,17 +51,41 @@ function extractCloudinaryPublicId(url) {
 function resolveCloudPublicId(record, { preferSigned = false } = {}) {
   if (!record) return null;
   if (preferSigned && record.signedFileId) return record.signedFileId;
-  if (record.filePublicId) return record.filePublicId;
-  if (record.fileId) return record.fileId;
+  if (preferSigned && record.bossSignedFilePublicId) return record.bossSignedFilePublicId;
+  if (preferSigned && record.bossSignedFileUrl) {
+    const fromBoss = extractCloudinaryPublicId(record.bossSignedFileUrl);
+    if (fromBoss) return fromBoss;
+  }
   if (preferSigned && record.signedFileUrl) {
     const fromSigned = extractCloudinaryPublicId(record.signedFileUrl);
     if (fromSigned) return fromSigned;
   }
+  if (record.filePublicId) return record.filePublicId;
+  if (record.fileId) return record.fileId;
   if (record.bossSignedFileUrl) {
     const fromBoss = extractCloudinaryPublicId(record.bossSignedFileUrl);
     if (fromBoss) return fromBoss;
   }
   return extractCloudinaryPublicId(record.fileUrl);
+}
+
+/** PDF record for approver review — boss-signed copy only, never the blank original. */
+function buildBossSignedPdfRecord(doc) {
+  if (!doc?.bossSignedFileUrl) return null;
+
+  const bossPublicId = doc.bossSignedFilePublicId
+    || extractCloudinaryPublicId(doc.bossSignedFileUrl);
+
+  return {
+    fileUrl:                doc.bossSignedFileUrl,
+    filePublicId:           bossPublicId || doc.filePublicId,
+    fileId:                 bossPublicId || doc.filePublicId,
+    localPdfPath:           doc.localBossSignedPdfPath || null,
+    localBossSignedPdfPath: doc.localBossSignedPdfPath || null,
+    bossSignedFileUrl:      doc.bossSignedFileUrl,
+    bossSignedFilePublicId: bossPublicId || '',
+    signedFileUrl:          doc.bossSignedFileUrl,
+  };
 }
 
 /** Server-side Cloudinary admin download (works when public PDF delivery is blocked). */
@@ -148,12 +172,24 @@ function readLocalPdf(localPdfPath) {
 async function getPdfBytes(record, { preferSigned = false } = {}) {
   if (!record) throw new Error('PDF record is missing.');
 
+  const wantBossSigned = preferSigned && !!(record.bossSignedFileUrl || record.signedFileUrl);
+
+  if (wantBossSigned && record.localBossSignedPdfPath) {
+    const bossLocal = readLocalPdf(record.localBossSignedPdfPath);
+    if (bossLocal) return bossLocal;
+  }
+
   if (preferSigned && record.localSignedPdfPath) {
     const signed = readLocalPdf(record.localSignedPdfPath);
     if (signed) return signed;
   }
 
-  if (record.localPdfPath) {
+  if (wantBossSigned && record.localPdfPath) {
+    const bossLocal = readLocalPdf(record.localPdfPath);
+    if (bossLocal) return bossLocal;
+  }
+
+  if (!wantBossSigned && record.localPdfPath) {
     const local = readLocalPdf(record.localPdfPath);
     if (local) return local;
   }
@@ -226,5 +262,6 @@ module.exports = {
   sendPdf,
   extractCloudinaryPublicId,
   resolveCloudPublicId,
+  buildBossSignedPdfRecord,
   PDF_DIR,
 };
