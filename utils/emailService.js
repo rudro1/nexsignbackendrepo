@@ -2921,15 +2921,10 @@ function buildEmailHtml(opts) {
 
   const headerBg   = headerBackgroundStyle(emailHeaderColor);
   const headerText = headerTextColor(emailHeaderColor);
-  const safeLogo   = normalizeLogoUrl(companyLogo);
-  const logoHtml = safeLogo
-    ? `<img src="${safeLogo}" alt="${escapeHtml(companyName || 'Logo')}" border="0"
-            style="display:block;max-height:44px;max-width:180px;width:auto;height:auto;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;" />`
-    : `<table cellpadding="0" cellspacing="0" border="0"><tr><td width="40" height="40" align="center" valign="middle"
-           style="width:40px;height:40px;border-radius:10px;background:#28ABDF;font-size:20px;font-weight:800;
-                  color:#ffffff;font-family:Georgia,serif;line-height:40px;text-align:center;">
-           ${escapeHtml(companyInitial || 'N')}
-         </td></tr></table>`;
+  const defaultBrandLogo = 'https://nexsign-front.vercel.app/nexsign-logo.png';
+  const safeLogo   = normalizeLogoUrl(companyLogo) || defaultBrandLogo;
+  const logoHtml = `<img src="${safeLogo}" alt="${escapeHtml(companyName || 'NexSign')}" border="0"
+            style="display:block;max-height:44px;max-width:180px;width:auto;height:auto;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;" />`;
 
   const safeDocTitle = escapeHtml(documentTitle || 'Document');
   const plainButtonLabel = (buttonText || 'Review & Sign Document')
