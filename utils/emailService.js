@@ -2921,7 +2921,7 @@ function buildEmailHtml(opts) {
 
   const headerBg   = headerBackgroundStyle(emailHeaderColor);
   const headerText = headerTextColor(emailHeaderColor);
-  const defaultBrandLogo = 'https://nexsign-front.vercel.app/nexsign-logo-dark.png';
+  const defaultBrandLogo = 'https://nexsign-front.vercel.app/nexsign-logo.png';
   const safeLogo   = normalizeLogoUrl(companyLogo) || defaultBrandLogo;
   const logoHtml = `<img src="${safeLogo}" alt="${escapeHtml(companyName || 'NexSign')}" border="0"
             style="display:block;max-height:44px;max-width:180px;width:auto;height:auto;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;" />`;
