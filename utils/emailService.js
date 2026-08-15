@@ -2924,7 +2924,7 @@ function buildEmailHtml(opts) {
   const defaultBrandLogo = 'https://nexsign-front.vercel.app/nexsign-logo.png';
   const safeLogo   = normalizeLogoUrl(companyLogo) || defaultBrandLogo;
   const logoHtml = `<img src="${safeLogo}" alt="${escapeHtml(companyName || 'NexSign')}" border="0"
-            style="display:block;max-height:48px;max-width:180px;width:auto;height:auto;border:0;outline:none;text-decoration:none;border-radius:10px;-ms-interpolation-mode:bicubic;" />`;
+            style="display:block;max-height:56px;max-width:200px;width:auto;height:auto;border:0;outline:none;text-decoration:none;border-radius:12px;-ms-interpolation-mode:bicubic;" />`;
 
   const safeDocTitle = escapeHtml(documentTitle || 'Document');
   const plainButtonLabel = (buttonText || 'Review & Sign Document')
