@@ -259,40 +259,92 @@ async function getGeoLocation(ip) {
 // BigDataCloud — free, no API key, Vercel এ perfect
 async function reverseGeocode(latitude, longitude) {
   try {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 5000);
+    const lat = parseFloat(latitude);
+    const lng = parseFloat(longitude);
+    if (Number.isNaN(lat) || Number.isNaN(lng)) return null;
 
-    const res = await fetch(
-      `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${latitude}&longitude=${longitude}&localityLanguage=en`,
-      { signal: controller.signal },
-    );
-    clearTimeout(tid);
+    // 1. BigDataCloud
+    try {
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch(
+        `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`,
+        { signal: controller.signal },
+      );
+      clearTimeout(tid);
 
-    if (!res.ok) return null;
-    const data = await res.json();
+      if (res.ok) {
+        const data = await res.json();
+        const city = data.city || data.locality || data.principalSubdivision || null;
+        const region = data.principalSubdivision || null;
+        const country = data.countryName || null;
+        const countryCode = data.countryCode || null;
+        const postalCode = data.postcode || null;
+        const timezone = data.timezone?.name || null;
 
-    // BigDataCloud response structure
-    const city       = data.city
-                    || data.locality
-                    || data.principalSubdivision
-                    || null;
-    const region     = data.principalSubdivision || null;
-    const country    = data.countryName          || null;
-    const countryCode= data.countryCode          || null;
-    const postalCode = data.postcode             || null;
-    const timezone   = data.timezone?.name       || null;
+        if (city || country) {
+          return {
+            city,
+            region,
+            country,
+            countryCode,
+            postalCode,
+            timezone,
+            latitude:  String(lat),
+            longitude: String(lng),
+            display:   [city, region, country].filter(Boolean).join(', ') + (postalCode ? ` (${postalCode})` : ''),
+            source:    'gps',
+          };
+        }
+      }
+    } catch (e1) {
+      console.warn('[reverseGeocode] BigDataCloud attempt failed:', e1.message);
+    }
+
+    // 2. OpenStreetMap Nominatim fallback
+    try {
+      const controller2 = new AbortController();
+      const tid2 = setTimeout(() => controller2.abort(), 4000);
+      const res2 = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=14&addressdetails=1`,
+        {
+          signal:  controller2.signal,
+          headers: { 'User-Agent': 'NexSign-App/2.0 (legal-audit@nexsign.com)' },
+        },
+      );
+      clearTimeout(tid2);
+
+      if (res2.ok) {
+        const data2 = await res2.json();
+        const addr = data2.address || {};
+        const city = addr.city || addr.town || addr.village || addr.suburb || addr.county || null;
+        const region = addr.state || addr.region || null;
+        const country = addr.country || null;
+        const postalCode = addr.postcode || null;
+
+        return {
+          city,
+          region,
+          country,
+          countryCode: addr.country_code?.toUpperCase() || null,
+          postalCode,
+          timezone: null,
+          latitude:  String(lat),
+          longitude: String(lng),
+          display:   [city, region, country].filter(Boolean).join(', ') + (postalCode ? ` (${postalCode})` : ''),
+          source:    'gps',
+        };
+      }
+    } catch (e2) {
+      console.warn('[reverseGeocode] Nominatim attempt failed:', e2.message);
+    }
 
     return {
-      city,
-      region,
-      country,
-      countryCode,
-      postalCode,
-      timezone,
-      latitude:  String(latitude),
-      longitude: String(longitude),
-      display: [city, region, country, postalCode]
-        .filter(Boolean).join(', '),
+      city: null, region: null, country: null, countryCode: null, postalCode: null, timezone: null,
+      latitude:  String(lat),
+      longitude: String(lng),
+      display:   `GPS: ${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+      source:    'gps',
     };
   } catch (e) {
     console.warn('[reverseGeocode] failed:', e.message);
@@ -1173,7 +1225,7 @@ router.post('/sign/submit', async (req, res) => {
     // ✅ Server time — always correct, browser time এর উপর depend করে না
     const localTime = new Date().toUTCString();
 
-    // Geo lookup — cap at 2s so signers are not blocked on external APIs
+    // Geo lookup — give up to 4s for high-accuracy GPS reverse geocode
     let geo = null;
     try {
       geo = await Promise.race([
@@ -1184,7 +1236,7 @@ router.post('/sign/submit', async (req, res) => {
           }
           return getGeoLocation(ip);
         })(),
-        new Promise(resolve => setTimeout(() => resolve(null), 2000)),
+        new Promise(resolve => setTimeout(() => resolve(null), 4000)),
       ]);
     } catch (geoErr) {
       console.warn('[sign/submit] Geo lookup failed:', geoErr.message);
@@ -1235,6 +1287,41 @@ router.post('/sign/submit', async (req, res) => {
     const nextIdx = idx + 1;
     const hasNext = nextIdx < doc.parties.length;
 
+    // Record audit log for THIS signer
+    safeAuditLog({
+      document_id:    doc._id,
+      document_title: doc.title,
+      action:         'signed',
+      performed_by: {
+        name:        party.name,
+        email:       party.email,
+        designation: party.designation || null,
+        role:        'signer',
+        party_index: idx,
+      },
+      device: {
+        device_name: device.device,
+        browser:     device.browser,
+        os:          device.os,
+      },
+      location: {
+        ip_address:  ip,
+        city:        geo?.city,
+        region:      geo?.region,
+        country:     geo?.country,
+        postal_code: geo?.postalCode,
+        timezone:    geo?.timezone,
+        latitude:    geo?.latitude,
+        longitude:   geo?.longitude,
+        display:     geo?.display,
+        geo_source:  geo?.source || (geo?.latitude ? 'gps' : 'ip'),
+      },
+      local_time: localTime,
+      cc_list: doc.ccList.map(cc => ({
+        name: cc.name, email: cc.email, designation: cc.designation,
+      })),
+    });
+
     if (hasNext) {
       const nextToken = crypto.randomBytes(32).toString('hex');
       const nextParty = doc.parties[nextIdx];
@@ -1247,37 +1334,6 @@ router.post('/sign/submit', async (req, res) => {
       doc.currentPartyIndex = nextIdx;
 
       await doc.save();
-
-      safeAuditLog({
-        document_id:    doc._id,
-        document_title: doc.title,
-        action:         'signed',
-        performed_by: {
-          name:        party.name,
-          email:       party.email,
-          designation: party.designation,
-          role:        'signer',
-          party_index: idx,
-        },
-        device: {
-          device_name: device.device,
-          browser:     device.browser,
-          os:          device.os,
-        },
-        location: {
-          ip_address: ip,
-          city:       geo?.city,
-          region:     geo?.region,
-          country:    geo?.country,
-          postalCode: geo?.postalCode,
-          timezone:   geo?.timezone,
-          display:    geo?.display,
-        },
-        local_time: localTime,
-        cc_list: doc.ccList.map(cc => ({
-          name: cc.name, email: cc.email, designation: cc.designation,
-        })),
-      });
 
       const ownerUser = await User.findById(doc.owner)
         .select('full_name name email designation company_logo')
@@ -1304,10 +1360,11 @@ router.post('/sign/submit', async (req, res) => {
         next:    true,
         message: `Document sent to next signer: ${nextParty.name}`,
         signerInfo: {
-          name:     party.name,
-          device:   device.device,
-          location: geo?.display || 'Unknown',
-          time:     localTime,
+          name:        party.name,
+          designation: party.designation || null,
+          device:      device.device,
+          location:    geo?.display || 'Unknown',
+          time:        localTime,
         },
       });
 
@@ -1315,6 +1372,39 @@ router.post('/sign/submit', async (req, res) => {
       doc.status      = 'completed';
       doc.completedAt = new Date();
       await doc.save();
+
+      // Record final document completion in audit log
+      safeAuditLog({
+        document_id:     doc._id,
+        document_title:  doc.title,
+        document_status: 'completed',
+        action:          'completed',
+        performed_by: {
+          name:        'System',
+          role:        'system',
+        },
+        device: {
+          device_name: device.device,
+          browser:     device.browser,
+          os:          device.os,
+        },
+        location: {
+          ip_address:  ip,
+          city:        geo?.city,
+          region:      geo?.region,
+          country:     geo?.country,
+          postal_code: geo?.postalCode,
+          timezone:    geo?.timezone,
+          latitude:    geo?.latitude,
+          longitude:   geo?.longitude,
+          display:     geo?.display,
+          geo_source:  geo?.source || (geo?.latitude ? 'gps' : 'ip'),
+        },
+        local_time: localTime,
+        cc_list: doc.ccList.map(cc => ({
+          name: cc.name, email: cc.email, designation: cc.designation,
+        })),
+      });
 
       emitSocket(req, 'document:completed', {
         documentId:  String(doc._id),
@@ -1335,10 +1425,11 @@ router.post('/sign/submit', async (req, res) => {
         message:   'Document signed and completed!',
         document:  { _id: String(doc._id) },
         signerInfo: {
-          name:     party.name,
-          device:   device.device,
-          location: geo?.display || 'Unknown',
-          time:     localTime,
+          name:        party.name,
+          designation: party.designation || null,
+          device:      device.device,
+          location:    geo?.display || 'Unknown',
+          time:        localTime,
         },
       });
     }

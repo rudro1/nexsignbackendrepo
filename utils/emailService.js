@@ -3466,8 +3466,9 @@ async function sendEmployeeSignedCopyEmail(data) {
     auditNote = data.parties.map((p, i) => {
       const loc = [p.city, p.region, p.country, p.postalCode].filter(Boolean).join(', ') || 'N/A';
       const dev = [p.device, p.browser, p.os].filter(Boolean).join(' / ') || 'N/A';
+      const signerTitle = p.designation ? `${p.name || 'Signer'} (${p.designation})` : (p.name || 'Signer');
       return [
-        `${i + 1}. ${p.name || 'Signer'} (${p.email || ''})`,
+        `${i + 1}. ${signerTitle} — ${p.email || ''}`,
         `   Signed: ${p.localSignedTime || p.signedAt || 'N/A'}`,
         `   Location: ${loc}`,
         `   IP: ${p.ipAddress || p.ip || 'N/A'} · Device: ${dev}`,
@@ -3494,8 +3495,9 @@ async function sendCompletionEmail(data) {
     auditNote = data.parties.map((p, i) => {
       const loc = [p.city, p.region, p.country, p.postalCode].filter(Boolean).join(', ') || 'N/A';
       const dev = [p.device, p.browser, p.os].filter(Boolean).join(' / ') || 'N/A';
+      const signerTitle = p.designation ? `${p.name || 'Signer'} (${p.designation})` : (p.name || 'Signer');
       return [
-        `${i + 1}. ${p.name || 'Signer'} (${p.email || ''})`,
+        `${i + 1}. ${signerTitle} — ${p.email || ''}`,
         `   Signed: ${p.localSignedTime || p.signedAt || 'N/A'}`,
         `   Location: ${loc}`,
         `   IP: ${p.ipAddress || p.ip || 'N/A'} · Device: ${dev}`,

@@ -1951,22 +1951,24 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc) {
 
     // Build detail lines for this signer
     const details = [];
-    if (s.role || s.designation)
-      details.push(['Role', safe(s.role || s.designation)]);
+    if (s.designation)
+      details.push(['Designation', safe(s.designation)]);
+    if (s.role)
+      details.push(['Signing Role', safe(s.role)]);
     if (s.localSignedAt || s.localSignedTime || s.signedAt)
       details.push(['Signed At', safe(s.localSignedAt || s.localSignedTime || new Date(s.signedAt).toUTCString())]);
     if (s.ipAddress || s.ip)
       details.push(['IP Address', safe(s.ipAddress || s.ip)]);
     if (s.device || s.browser)
-      details.push(['Device', safe([s.device, s.browser, s.os].filter(Boolean).join(' / '))]);
+      details.push(['Device / OS', safe([s.device, s.browser, s.os].filter(Boolean).join(' / '))]);
     if (s.city || s.country)
-      details.push(['Location', safe([s.city, s.region, s.country].filter(Boolean).join(', ') + (s.postalCode ? ` — ${s.postalCode}` : ''))]);
+      details.push(['Location', safe([s.city, s.region, s.country].filter(Boolean).join(', ') + (s.postalCode ? ` (${s.postalCode})` : ''))]);
     if (s.latitude && s.longitude)
-      details.push(['Coordinates', `${s.latitude}, ${s.longitude}${s.latitude.startsWith('-') ? '' : ''}`]);
+      details.push(['Coordinates (GPS)', `${s.latitude}, ${s.longitude}`]);
     if (s.timezone)
       details.push(['Timezone', safe(s.timezone)]);
     if (s.geoSource || s.geo_source)
-      details.push(['Location Source', safe(s.geoSource || s.geo_source)]);
+      details.push(['Location Source', safe((s.geoSource || s.geo_source || '').toUpperCase())]);
 
     const rowH = 46 + details.length * 13;
 
@@ -1987,8 +1989,9 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc) {
     page.drawCircle({ x: M + 18, y: Y - 18, size: 11, color: signed ? C.green : C.amber });
     txt(page, String(i + 1), M + (i < 9 ? 15 : 11), Y - 22, { font: fontB, size: 8.5, color: C.white });
 
-    // Name, email
-    txt(page, safe(s.name || s.recipientName || 'Unknown'), M + 36, Y - 12, { font: fontB, size: 10, color: C.dark });
+    // Name + Designation, email
+    const nameWithDesig = safe([s.name || s.recipientName || 'Unknown', s.designation ? `(${s.designation})` : ''].filter(Boolean).join(' '));
+    txt(page, nameWithDesig, M + 36, Y - 12, { font: fontB, size: 9.5, color: C.dark, maxWidth: CW - 120 });
     txt(page, safe(s.email || s.recipientEmail || ''), M + 36, Y - 26, { font: fontM, size: 8, color: C.grey, maxWidth: CW / 2 });
 
     // Status badge

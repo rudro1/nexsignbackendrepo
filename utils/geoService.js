@@ -103,29 +103,93 @@ async function reverseGeocode(latitude, longitude) {
     const lng = parseFloat(longitude);
     if (Number.isNaN(lat) || Number.isNaN(lng)) return null;
 
-    const ctrl = new AbortController();
-    const tid  = setTimeout(() => ctrl.abort(), 6000);
-    const url  = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`;
-    const res  = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(tid);
+    // 1. Try BigDataCloud reverse geocode client
+    try {
+      const ctrl = new AbortController();
+      const tid  = setTimeout(() => ctrl.abort(), 4000);
+      const url  = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`;
+      const res  = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(tid);
 
-    if (!res.ok) return null;
-    const d = await res.json();
+      if (res.ok) {
+        const d = await res.json();
+        const city = d.city || d.locality || d.principalSubdivision || '';
+        const region = d.principalSubdivision || d.localityInfo?.administrative?.[1]?.name || '';
+        const country = d.countryName || '';
+        const postal = d.postcode || '';
 
+        if (city || country) {
+          return {
+            city,
+            region,
+            country,
+            countryCode: d.countryCode || '',
+            postalCode:  postal,
+            timezone:    '',
+            latitude:    String(lat),
+            longitude:   String(lng),
+            display:     [city, region, country].filter(Boolean).join(', ') + (postal ? ` (${postal})` : ''),
+            source:      'gps',
+          };
+        }
+      }
+    } catch (e) {
+      console.warn('[geoService] BigDataCloud reverse geocode failed:', e.message);
+    }
+
+    // 2. High-accuracy fallback: OpenStreetMap Nominatim
+    try {
+      const ctrl2 = new AbortController();
+      const tid2  = setTimeout(() => ctrl2.abort(), 4000);
+      const res2  = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=14&addressdetails=1`,
+        {
+          signal:  ctrl2.signal,
+          headers: { 'User-Agent': 'NexSign-App/2.0 (legal-audit@nexsign.com)' },
+        },
+      );
+      clearTimeout(tid2);
+
+      if (res2.ok) {
+        const d2 = await res2.json();
+        const addr = d2.address || {};
+        const city = addr.city || addr.town || addr.village || addr.suburb || addr.county || '';
+        const region = addr.state || addr.region || '';
+        const country = addr.country || '';
+        const postal = addr.postcode || '';
+
+        return {
+          city,
+          region,
+          country,
+          countryCode: addr.country_code?.toUpperCase() || '',
+          postalCode:  postal,
+          timezone:    '',
+          latitude:    String(lat),
+          longitude:   String(lng),
+          display:     [city, region, country].filter(Boolean).join(', ') + (postal ? ` (${postal})` : ''),
+          source:      'gps',
+        };
+      }
+    } catch (e2) {
+      console.warn('[geoService] Nominatim reverse geocode failed:', e2.message);
+    }
+
+    // Fallback: return raw GPS coordinates
     return {
-      city:        d.city        || d.locality     || '',
-      region:      d.principalSubdivision || d.localityInfo?.administrative?.[1]?.name || '',
-      country:     d.countryName || '',
-      countryCode: d.countryCode || '',
-      postalCode:  d.postcode    || '',
+      city:        '',
+      region:      '',
+      country:     '',
+      countryCode: '',
+      postalCode:  '',
       timezone:    '',
       latitude:    String(lat),
       longitude:   String(lng),
-      display:     [d.locality, d.principalSubdivision, d.countryName, d.postcode].filter(Boolean).join(', '),
+      display:     `GPS: ${lat.toFixed(5)}, ${lng.toFixed(5)}`,
       source:      'gps',
     };
   } catch (e) {
-    console.warn('[geoService] reverseGeocode failed:', e.message);
+    console.warn('[geoService] reverseGeocode general failure:', e.message);
     return null;
   }
 }
