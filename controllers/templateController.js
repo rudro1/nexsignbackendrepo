@@ -1980,33 +1980,20 @@ const employeeSign = asyncHandler(async (req, res) => {
     req,
   };
 
-  if (IS_SERVERLESS) {
-    try {
-      await finalizeEmployeeSign(finalizeOpts);
-    } catch (err) {
-      console.error('[employeeSign]', err.message, err.stack);
-      return res.status(502).json({
-        success: false,
-        message: 'Signature recorded but PDF/email delivery failed. Please contact the sender.',
-      });
-    }
-    return res.json({
-      success:  true,
-      message:  'Document signed successfully! A copy has been emailed to you.',
-      signedAt: new Date(),
+  try {
+    await finalizeEmployeeSign(finalizeOpts);
+  } catch (err) {
+    console.error('[employeeSign]', err.message, err.stack);
+    return res.status(502).json({
+      success: false,
+      message: 'Signature recorded but PDF/email delivery failed. Please contact the sender.',
     });
   }
 
-  res.json({
-    success:   true,
-    message:   'Document signed successfully! A copy will be emailed to you.',
-    signedAt:  new Date(),
-  });
-
-  setImmediate(() => {
-    finalizeEmployeeSign(finalizeOpts).catch(err => {
-      console.error('[employeeSign background]', err.message, err.stack);
-    });
+  return res.json({
+    success:  true,
+    message:  'Document signed successfully! A copy has been emailed to you.',
+    signedAt: new Date(),
   });
 });
 

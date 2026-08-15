@@ -29,8 +29,8 @@ async function main() {
   ok('Health', health.status === 200 && health.data?.success);
 
   const login = await req('POST', '/auth/login', {
-    email:    'fixdev@fixensy.com',
-    password: 'FixPass1+',
+    email:    process.env.SEED_ADMIN_EMAIL    || '',
+    password: process.env.SEED_ADMIN_PASSWORD || '',
   });
   ok('Admin login', login.status === 200 && login.data?.token);
   const token = login.data?.token;

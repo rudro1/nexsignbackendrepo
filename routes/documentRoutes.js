@@ -880,35 +880,35 @@ router.post(
         status:     doc.status,
       });
 
-      res.json({ success: true, document: sanitizeDoc(doc), emailSent: true });
-
-      sendSigningEmail(signingPayload).then(result => {
-        if (!result?.success) {
-          console.error('[upload-and-send] First email failed:', result?.error);
-        } else {
-          console.log(`[upload-and-send] First email sent to ${first.email}${reviewPdfBuffer ? ' (with PDF)' : ''}`);
-        }
-      }).catch(emailErr => {
+      const signingResult = await sendSigningEmail(signingPayload).catch(emailErr => {
         console.error('[upload-and-send] First email failed:', emailErr.message);
+        return null;
       });
+      if (signingResult && !signingResult.success) {
+        console.error('[upload-and-send] First email failed:', signingResult.error);
+      } else if (signingResult) {
+        console.log(`[upload-and-send] First email sent to ${first.email}${reviewPdfBuffer ? ' (with PDF)' : ''}`);
+      }
 
-      parsedCC.forEach(cc =>
-        sendCCEmail({
-          recipientEmail:       cc.email,
-          recipientName:        cc.name,
-          recipientDesignation: cc.designation,
-          documentTitle:        doc.title,
-          senderName:           req.user.full_name,
-          senderDesignation:    req.user.designation,
-          companyLogoUrl:       resolvedLogo || doc.companyLogo,
-          ownerCompanyLogo:     req.user.company_logo || '',
-          companyName:          doc.companyName,
-          emailHeaderColor:     doc.emailHeaderColor,
-          parties:              parsedParties,
-        }).catch(e => console.error('[upload-and-send] CC email failed:', e.message)),
+      await Promise.allSettled(
+        parsedCC.map(cc =>
+          sendCCEmail({
+            recipientEmail:       cc.email,
+            recipientName:        cc.name,
+            recipientDesignation: cc.designation,
+            documentTitle:        doc.title,
+            senderName:           req.user.full_name,
+            senderDesignation:    req.user.designation,
+            companyLogoUrl:       resolvedLogo || doc.companyLogo,
+            ownerCompanyLogo:     req.user.company_logo || '',
+            companyName:          doc.companyName,
+            emailHeaderColor:     doc.emailHeaderColor,
+            parties:              parsedParties,
+          }).catch(e => console.error('[upload-and-send] CC email failed:', e.message)),
+        ),
       );
 
-      return;
+      return res.json({ success: true, document: sanitizeDoc(doc), emailSent: true });
 
     } catch (err) {
       console.error('[POST /upload-and-send]', err.message);
@@ -1322,9 +1322,11 @@ router.post('/sign/submit', async (req, res) => {
         completedAt: doc.completedAt,
       });
 
-      _finalizeDocument(req, doc._id).catch(e =>
-        console.error('[finalize]', e.message)
-      );
+      try {
+        await _finalizeDocument(req, doc._id);
+      } catch (finalizeErr) {
+        console.error('[finalize] PDF/email delivery failed:', finalizeErr.message);
+      }
 
       return res.json({
         success:   true,
@@ -1368,11 +1370,22 @@ router.post('/sign/finalize/:docId', async (req, res) => {
       });
     }
 
-    res.json({ success: true, message: 'Finalization started.' });
+    try {
+      await _finalizeDocument(req, doc._id);
+    } catch (e) {
+      console.error('[finalize endpoint]', e.message);
+      return res.status(502).json({
+        success: false,
+        message: 'Finalization failed. PDF/email delivery could not complete.',
+      });
+    }
 
-    _finalizeDocument(req, doc._id).catch(e =>
-      console.error('[finalize endpoint]', e.message)
-    );
+    const updated = await Document.findById(doc._id).select('signedFileUrl').lean();
+    return res.json({
+      success:      true,
+      message:      'Document finalized.',
+      signedPdfUrl: updated?.signedFileUrl || null,
+    });
 
   } catch (err) {
     console.error('[POST /sign/finalize/:docId]', err.message);
@@ -1518,36 +1531,38 @@ router.post('/:id/reuse', auth, async (req, res) => {
       status:     newDoc.status,
     });
 
-    res.status(201).json({
-      success:  true,
-      message:  `New signing request sent to ${newDoc.parties[0].name}.`,
-      document: sanitizeDoc(newDoc),
-    });
-
     const signingPayload = {
       ...buildSequentialSigningPayload(
         newDoc, newDoc.parties[0], 0, ownerUser, resolvedLogo,
       ),
       pdfBuffer: await loadDocumentReviewPdf(newDoc),
     };
-    sendSigningEmail(signingPayload).catch(emailErr => {
+    await sendSigningEmail(signingPayload).catch(emailErr => {
       console.error('[reuse] First email failed:', emailErr.message);
     });
 
-    parsedCC.forEach(cc =>
-      sendCCEmail({
-        recipientEmail:       cc.email,
-        recipientName:        cc.name,
-        recipientDesignation: cc.designation,
-        senderName:           req.user.full_name,
-        senderDesignation:    req.user.designation,
-        documentTitle:        newDoc.title,
-        companyLogoUrl:       newDoc.companyLogo,
-        ownerCompanyLogo:     req.user.company_logo || '',
-        companyName:          newDoc.companyName,
-        emailHeaderColor:     newDoc.emailHeaderColor,
-      }).catch(e => console.error('[reuse] CC email failed:', e.message)),
+    await Promise.allSettled(
+      parsedCC.map(cc =>
+        sendCCEmail({
+          recipientEmail:       cc.email,
+          recipientName:        cc.name,
+          recipientDesignation: cc.designation,
+          senderName:           req.user.full_name,
+          senderDesignation:    req.user.designation,
+          documentTitle:        newDoc.title,
+          companyLogoUrl:       newDoc.companyLogo,
+          ownerCompanyLogo:     req.user.company_logo || '',
+          companyName:          newDoc.companyName,
+          emailHeaderColor:     newDoc.emailHeaderColor,
+        }).catch(e => console.error('[reuse] CC email failed:', e.message)),
+      ),
     );
+
+    return res.status(201).json({
+      success:  true,
+      message:  `New signing request sent to ${newDoc.parties[0].name}.`,
+      document: sanitizeDoc(newDoc),
+    });
   } catch (err) {
     console.error('[POST /documents/:id/reuse]', err.message);
     return res.status(500).json({ success: false, message: err.message });
@@ -1721,25 +1736,31 @@ router.get('/:id/pdf', auth, async (req, res) => {
     const wantSigned = req.query.signed === '1' && doc.status === 'completed';
 
     if (wantSigned && !doc.signedFileUrl && !doc.localSignedPdfPath) {
-      _finalizeDocument(req, doc._id).catch(e =>
-        console.error('[GET /documents/:id/pdf] finalize retry:', e.message),
-      );
+      let finalizeOk = false;
+      try {
+        await _finalizeDocument(req, doc._id);
+        finalizeOk = true;
+      } catch (e) {
+        console.warn('[GET /documents/:id/pdf] finalize failed, serving preview:', e.message);
+      }
 
-      const filledFields = (doc.fields || []).filter(
-        f => f.value && String(f.value).trim(),
-      );
-      if (filledFields.length > 0) {
-        try {
-          const merged = await mergeSignaturesIntoPDF(doc, filledFields);
-          let previewBuffer;
+      if (!finalizeOk) {
+        const filledFields = (doc.fields || []).filter(
+          f => f.value && String(f.value).trim(),
+        );
+        if (filledFields.length > 0) {
           try {
-            previewBuffer = Buffer.from(await appendAuditPage(merged, doc));
-          } catch {
-            previewBuffer = Buffer.from(merged);
+            const merged = await mergeSignaturesIntoPDF(doc, filledFields);
+            let previewBuffer;
+            try {
+              previewBuffer = Buffer.from(await appendAuditPage(merged, doc));
+            } catch {
+              previewBuffer = Buffer.from(merged);
+            }
+            return sendPdf(res, previewBuffer, doc.title);
+          } catch (genErr) {
+            console.warn('[GET /documents/:id/pdf] On-the-fly signed PDF failed:', genErr.message);
           }
-          return sendPdf(res, previewBuffer, doc.title);
-        } catch (genErr) {
-          console.warn('[GET /documents/:id/pdf] On-the-fly signed PDF failed:', genErr.message);
         }
       }
     }

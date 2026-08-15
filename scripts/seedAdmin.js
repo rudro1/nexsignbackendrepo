@@ -10,13 +10,18 @@ const mongoose = require('mongoose');
 const User     = require('../models/User');
 
 const ADMIN = {
-  full_name:         'Fixensy Admin',
-  email:             'fixdev@fixensy.com',
-  password:          'FixPass1+',
+  full_name:         process.env.SEED_ADMIN_NAME     || 'NexSign Admin',
+  email:             process.env.SEED_ADMIN_EMAIL,
+  password:          process.env.SEED_ADMIN_PASSWORD,
   role:              'super_admin',
   is_email_verified: true,
   is_active:         true,
 };
+
+if (!ADMIN.email || !ADMIN.password) {
+  console.error('SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD env vars are required.');
+  process.exit(1);
+}
 
 async function main() {
   if (!process.env.MONGO_URI) {

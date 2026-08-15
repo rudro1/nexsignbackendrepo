@@ -552,11 +552,13 @@ const bossSignCampaign = asyncHandler(async (req, res) => {
   }
 
   let signatureImageUrl = null;
+  let signatureImageWarning = null;
   try {
     const uploaded = await uploadSignaturePng(signatureDataUrl, 'nexsign/boss-signatures');
     signatureImageUrl = uploaded.secure_url;
   } catch (e) {
-    console.error('[bossSignCampaign]', e.message);
+    signatureImageWarning = 'Signature preview image could not be saved to Cloudinary.';
+    console.error('[bossSignCampaign] Cloudinary signature image upload failed:', e.message);
   }
 
   const { embedBossSignatureOnRecord } = require('./templateController');
@@ -585,6 +587,7 @@ const bossSignCampaign = asyncHandler(async (req, res) => {
     message: result.phase === 'approver_pending'
       ? 'Signed! Approver chain started.'
       : `Signed! ${result.emailsSent || 0} employee email(s) sent.`,
+    ...(signatureImageWarning && { warning: signatureImageWarning }),
     ...result,
   });
 });

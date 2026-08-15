@@ -129,7 +129,7 @@ async function run() {
 
   // Admin
   const adminLogin = await req('POST', '/auth/login', {
-    email: 'fixdev@fixensy.com', password: 'FixPass1+',
+    email: process.env.SEED_ADMIN_EMAIL || '', password: process.env.SEED_ADMIN_PASSWORD || '',
   });
   const adminToken = adminLogin.data?.token;
 

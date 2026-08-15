@@ -49,7 +49,6 @@ const ALLOWED_ORIGINS = [
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
   if (ALLOWED_ORIGINS.includes(origin)) return true;
-  if (origin.endsWith('.vercel.app')) return true;
   return false;
 };
 
