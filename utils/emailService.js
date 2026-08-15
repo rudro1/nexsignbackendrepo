@@ -3168,10 +3168,9 @@ function buildEmailHtml(opts) {
                 <td style="vertical-align:middle;">
                   <table cellpadding="0" cellspacing="0">
                     <tr>
-                      <td style="vertical-align:middle;padding-right:8px;">
-                        <div style="width:28px;height:28px;background:linear-gradient(135deg,#28ABDF,#1d6fa8);
-                                    border-radius:7px;text-align:center;line-height:28px;
-                                    font-size:13px;font-weight:900;color:#fff;">N</div>
+                      <td style="vertical-align:middle;padding-right:10px;">
+                        <img src="https://nexsign-front.vercel.app/nexsign-logo.png" alt="NexSign" border="0"
+                             style="display:block;width:32px;height:32px;border-radius:8px;object-fit:contain;border:1px solid #e2e8f0;" />
                       </td>
                       <td style="vertical-align:middle;">
                         <p style="margin:0;font-size:13px;font-weight:700;color:#0f172a;">NexSign</p>
