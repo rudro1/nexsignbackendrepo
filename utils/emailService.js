@@ -2671,15 +2671,31 @@ const EMAIL_CONFIG = {
     hasPdf:      true,
   },
 
-  cc_notification: {
-    subject:     d => `[Copy] "${d.docTitle}" — Fully executed`,
+  cc_initial_notice: {
+    subject:     d => `[CC Notice] "${d.docTitle}" — Sent for Signature`,
     heroIcon:    'copy',
     iconBg:      '#FAF5FF',
-    heroTitle:   () => 'Courtesy Copy — For Your Records',
+    heroTitle:   () => 'Document Sent for Signature',
     bodyParagraphs: d => [
       `Dear ${escapeHtml(d.ccName || d.signerName)},`,
-      `You are receiving this email as a courtesy copy. <strong>${escapeHtml(d.docTitle)}</strong> has been fully signed by all required parties.`,
-      `The completed document is attached for your reference and records.`,
+      `You are receiving this notification as a courtesy copy. <strong>${escapeHtml(d.docTitle)}</strong> has been prepared and sent for electronic signature.`,
+      `This document is currently undergoing sequential signing by the designated parties. No action is required from you at this time.`,
+      `Once all parties have completed signing, you will automatically receive an email with the fully executed document and Certificate of Completion attached.`,
+    ],
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
+    showButton:  false,
+    hasPdf:      false,
+  },
+
+  cc_notification: {
+    subject:     d => `[Completed Copy] "${d.docTitle}" — Fully Executed`,
+    heroIcon:    'copy',
+    iconBg:      '#FAF5FF',
+    heroTitle:   () => 'Completed Document — For Your Records',
+    bodyParagraphs: d => [
+      `Dear ${escapeHtml(d.ccName || d.signerName)},`,
+      `You are receiving this email as a courtesy copy. <strong>${escapeHtml(d.docTitle)}</strong> has been fully signed and executed by all required parties.`,
+      `The finalized document with the legal Certificate of Completion (audit trail) is attached to this email for your reference and records.`,
     ],
     closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
     showButton:  false,
@@ -2859,6 +2875,19 @@ function isValidEmailLogoUrl(url) {
   }
 }
 
+function emailSafeCloudinaryLogo(url) {
+  if (!url || typeof url !== 'string') return '';
+  if (!url.includes('res.cloudinary.com')) return url;
+  // Raw files or non-image assets should not be modified
+  if (url.includes('/raw/upload/')) return url;
+  // If already transformed or format specified, return as-is
+  if (url.includes('/f_png') || url.includes('/f_jpg') || url.includes('/f_auto') || url.includes('/c_limit') || url.includes('/w_')) {
+    return url;
+  }
+  // Safely insert standard optimization for emails
+  return url.replace('/image/upload/', '/image/upload/f_png,q_auto,w_360/');
+}
+
 function normalizeLogoUrl(url) {
   if (!isValidEmailLogoUrl(url)) return '';
   const trimmed = url.trim();
@@ -2879,13 +2908,6 @@ function resolveEmailLogo(data = {}) {
   return '';
 }
 
-/** Cloudinary: force PNG + reasonable width for email client compatibility */
-function emailSafeCloudinaryLogo(url) {
-  if (!url.includes('res.cloudinary.com') || !url.includes('/image/upload/')) return url;
-  if (url.includes('/f_png') || url.includes('/f_jpg') || url.includes('/f_auto')) return url;
-  return url.replace('/upload/', '/upload/f_png,q_auto,w_320/');
-}
-
 // ─── Build full HTML email ────────────────────────────────────────────────────
 function buildEmailHtml(opts) {
   const {
@@ -2901,12 +2923,12 @@ function buildEmailHtml(opts) {
   const headerText = headerTextColor(emailHeaderColor);
   const safeLogo   = normalizeLogoUrl(companyLogo);
   const logoHtml = safeLogo
-    ? `<img src="${safeLogo}" alt="${companyName || 'Logo'}" width="160" height="40" border="0"
-           style="display:block;max-height:40px;max-width:160px;width:auto;height:40px;border:0;outline:none;text-decoration:none;" />`
-    : `<table cellpadding="0" cellspacing="0" border="0"><tr><td width="44" height="44" align="center" valign="middle"
-           style="width:44px;height:44px;border-radius:10px;background:#28ABDF;font-size:22px;font-weight:800;
-                  color:#ffffff;font-family:Georgia,serif;line-height:44px;text-align:center;">
-           ${companyInitial || 'N'}
+    ? `<img src="${safeLogo}" alt="${escapeHtml(companyName || 'Logo')}" border="0"
+            style="display:block;max-height:44px;max-width:180px;width:auto;height:auto;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;" />`
+    : `<table cellpadding="0" cellspacing="0" border="0"><tr><td width="40" height="40" align="center" valign="middle"
+           style="width:40px;height:40px;border-radius:10px;background:#28ABDF;font-size:20px;font-weight:800;
+                  color:#ffffff;font-family:Georgia,serif;line-height:40px;text-align:center;">
+           ${escapeHtml(companyInitial || 'N')}
          </td></tr></table>`;
 
   const safeDocTitle = escapeHtml(documentTitle || 'Document');
@@ -2920,7 +2942,7 @@ function buildEmailHtml(opts) {
 
   const buttonHtml = showButton && actionUrl ? `
     <tr>
-      <td style="padding:8px 40px 28px;">
+      <td class="action-btn-cell" style="padding:8px 40px 28px;">
         <table cellpadding="0" cellspacing="0" width="100%">
           <tr>
             <td align="center">
@@ -2935,6 +2957,7 @@ function buildEmailHtml(opts) {
               <![endif]-->
               <!--[if !mso]><!-->
               <a href="${actionUrl}"
+                 class="action-btn"
                  style="display:inline-block;background-color:#0284c7;color:#ffffff;text-decoration:none;
                         font-size:15px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
                         padding:14px 36px;border-radius:8px;letter-spacing:0.2px;mso-padding-alt:0;">
@@ -2983,26 +3006,39 @@ function buildEmailHtml(opts) {
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <meta name="x-apple-disable-message-reformatting"/>
   <title>${subject}</title>
   <!--[if mso]><noscript><xml><o:OfficeDocumentSettings>
     <o:PixelsPerInch>96</o:PixelsPerInch>
   </o:OfficeDocumentSettings></xml></noscript><![endif]-->
+  <style>
+    @media only screen and (max-width: 600px) {
+      .email-container { width: 100% !important; max-width: 100% !important; border-radius: 8px !important; }
+      .header-cell { padding: 18px 20px !important; }
+      .content-cell { padding: 24px 20px 0 !important; }
+      .details-cell { padding: 20px 20px !important; }
+      .action-btn-cell { padding: 8px 20px 24px !important; }
+      .action-btn { display: block !important; width: 100% !important; padding: 14px 16px !important; box-sizing: border-box !important; text-align: center !important; }
+      .stack-col { display: block !important; width: 100% !important; box-sizing: border-box !important; padding-right: 0 !important; margin-bottom: 12px !important; }
+      .stack-col:last-child { margin-bottom: 0 !important; }
+      .footer-cell { padding: 20px 20px 28px !important; }
+    }
+  </style>
 </head>
-<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;-webkit-font-smoothing:antialiased;">
 
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 16px;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:24px 12px;">
     <tr><td align="center">
 
       <!-- ═══ Card ═══ -->
-      <table width="600" cellpadding="0" cellspacing="0"
+      <table width="600" cellpadding="0" cellspacing="0" class="email-container"
              style="max-width:600px;width:100%;background:#ffffff;border-radius:16px;
                     box-shadow:0 4px 24px rgba(0,0,0,0.08);overflow:hidden;">
 
         <!-- HEADER: Company branding -->
         <tr>
-          <td bgcolor="${headerBg}" style="background-color:${headerBg};padding:24px 40px;">
+          <td bgcolor="${headerBg}" class="header-cell" style="background-color:${headerBg};padding:24px 40px;">
             <table width="100%" cellpadding="0" cellspacing="0">
               <tr>
                 <td style="vertical-align:middle;">${logoHtml}</td>
@@ -3016,7 +3052,7 @@ function buildEmailHtml(opts) {
 
         <!-- BODY -->
         <tr>
-          <td style="padding:36px 40px 0;">
+          <td class="content-cell" style="padding:36px 40px 0;">
             <h1 style="margin:0 0 20px;font-size:20px;font-weight:700;color:#0f172a;line-height:1.35;
                        font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
               ${heroTitle}
@@ -3028,7 +3064,7 @@ function buildEmailHtml(opts) {
 
         <!-- DOCUMENT DETAILS -->
         <tr>
-          <td style="padding:28px 40px;">
+          <td class="details-cell" style="padding:28px 40px;">
             <p style="margin:0 0 12px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;
                       letter-spacing:0.6px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
               Document Details
@@ -3481,7 +3517,8 @@ async function sendCompletionEmail(data) {
 }
 
 async function sendCCEmail(data) {
-  return sendEmail('cc_notification', withEmailBranding(data, {
+  const emailType = data.isInitial ? 'cc_initial_notice' : 'cc_notification';
+  return sendEmail(emailType, withEmailBranding(data, {
     to:                data.recipientEmail,
     signerName:        data.recipientName,
     ccName:            data.recipientName || data.ccName,

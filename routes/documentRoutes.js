@@ -904,6 +904,7 @@ router.post(
             companyName:          doc.companyName,
             emailHeaderColor:     doc.emailHeaderColor,
             parties:              parsedParties,
+            isInitial:            true,
           }).catch(e => console.error('[upload-and-send] CC email failed:', e.message)),
         ),
       );
@@ -1554,6 +1555,7 @@ router.post('/:id/reuse', auth, async (req, res) => {
           ownerCompanyLogo:     req.user.company_logo || '',
           companyName:          newDoc.companyName,
           emailHeaderColor:     newDoc.emailHeaderColor,
+          isInitial:            true,
         }).catch(e => console.error('[reuse] CC email failed:', e.message)),
       ),
     );
@@ -2067,8 +2069,9 @@ async function _finalizeDocument(req, docOrId) {
 
     // ✅ Step 6: Emails — parallel but don't block
     console.log(`[finalize] Step 4: Sending emails...`);
-    const ownerRecord = await User.findById(freshDoc.owner).select('company_logo').lean();
+    const ownerRecord = await User.findById(freshDoc.owner).select('full_name name email company_logo').lean();
     const ownerLogo   = ownerRecord?.company_logo || '';
+    const ownerEmail  = ownerRecord?.email;
 
     const emailTargets = [
       ...freshDoc.parties.map(p => ({
@@ -2084,6 +2087,16 @@ async function _finalizeDocument(req, docOrId) {
         isCC:                 true,
       })),
     ];
+
+    // Ensure document owner receives the completed PDF if not already in targets
+    if (ownerEmail && !emailTargets.some(t => t.recipientEmail.toLowerCase() === ownerEmail.toLowerCase())) {
+      emailTargets.push({
+        recipientEmail:       ownerEmail,
+        recipientName:        ownerRecord?.full_name || ownerRecord?.name || 'Document Owner',
+        recipientDesignation: 'Owner',
+        isCC:                 false,
+      });
+    }
 
     const emailResults = await Promise.allSettled(
       emailTargets.map(t =>
