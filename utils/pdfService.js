@@ -1911,63 +1911,114 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
   let page = pdfDoc.addPage([PW, PH]);
   let Y    = PH;              // current Y from top (we draw downward)
 
-  // ── Header bar ────────────────────────────────────────────────────────────
-  rect(page, 0, PH - 90, PW, 90,  C.dark);   // dark background
-  rect(page, 0, PH - 90, PW, 3,   C.brand);  // top accent
-
-  // Company Logo or fallback "N"
+  // ── Professional Header (DocuSign/SignIt Style) ──────────────────────────
+  // Use user's brand color or default
+  const headerColor = doc.emailHeaderColor 
+    ? hexToRgb(doc.emailHeaderColor, C.dark) 
+    : C.dark;
+  
+  // Clean white background for header
+  rect(page, 0, PH - 100, PW, 100, rgb(1, 1, 1));
+  
+  // Company Logo (left side - user's brand)
   if (logoImage) {
-    // Embed actual company logo
-    const logoW = 54;
-    const logoH = 40;
     try {
+      const logoW = 120;
+      const logoH = 36;
       page.drawImage(logoImage, {
         x: M,
-        y: PH - 68,
+        y: PH - 70,
         width: logoW,
         height: logoH,
         opacity: 1,
       });
     } catch (e) {
-      // Fallback to "N" if image draw fails
-      rect(page, M, PH - 68, 36, 36, C.brand);
-      txt(page, 'N', M + 10, PH - 53, { font: fontB, size: 18, color: C.white });
+      // Fallback: Company name text
+      const companyName = safe(doc.companyName || 'Company');
+      txt(page, companyName, M, PH - 55, { 
+        font: fontB, 
+        size: 18, 
+        color: headerColor 
+      });
     }
   } else {
-    // Fallback: Simple "N" square
-    rect(page, M, PH - 68, 36, 36, C.brand);
-    txt(page, 'N', M + 10, PH - 53, { font: fontB, size: 18, color: C.white });
+    // Show company name if no logo
+    const companyName = safe(doc.companyName || 'Company');
+    txt(page, companyName, M, PH - 55, { 
+      font: fontB, 
+      size: 18, 
+      color: headerColor 
+    });
   }
+  
+  // "Audit Trail" title (right side)
+  txt(page, 'Audit Trail', PW - M - 100, PH - 45, { 
+    font: fontB, 
+    size: 20, 
+    color: C.dark 
+  });
+  
+  // Completed badge (top right - professional green badge like SignIt)
+  const badgeW = 90;
+  const badgeH = 26;
+  const badgeX = PW - M - badgeW;
+  const badgeY = PH - 75;
+  
+  // Green badge with border
+  rect(page, badgeX, badgeY, badgeW, badgeH, rgb(0.9, 0.98, 0.94));
+  page.drawRectangle({
+    x: badgeX,
+    y: badgeY,
+    width: badgeW,
+    height: badgeH,
+    borderColor: C.green,
+    borderWidth: 1.5,
+  });
+  
+  // Checkmark icon + "Completed" text
+  page.drawCircle({
+    x: badgeX + 15,
+    y: badgeY + 13,
+    size: 8,
+    color: C.green,
+  });
+  txt(page, '✓', badgeX + 11, badgeY + 10, { 
+    font: fontB, 
+    size: 10, 
+    color: C.white 
+  });
+  txt(page, 'Completed', badgeX + 28, badgeY + 10, { 
+    font: fontB, 
+    size: 9, 
+    color: C.green 
+  });
+  
+  // Thin border line below header
+  hr(page, PH - 102, 0, PW, rgb(0.9, 0.9, 0.9), 1);
+  
+  Y = PH - 120;
 
-  txt(page, 'NexSign', M + 44, PH - 50, { font: fontB, size: 15, color: C.white });
-  txt(page, 'Certificate of Completion  |  Audit Trail', M + 44, PH - 65, { font: fontR, size: 9, color: rgb(0.6, 0.75, 0.85) });
-
-  txt(page, `Generated: ${new Date().toUTCString()}`, M, PH - 82, { font: fontM, size: 7.5, color: rgb(0.45, 0.6, 0.7) });
-
-  // "COMPLETED" badge top-right
-  rect(page, PW - M - 80, PH - 66, 80, 22, C.green);
-  txt(page, 'COMPLETED', PW - M - 72, PH - 59, { font: fontB, size: 8, color: C.white });
-
-  Y = PH - 106;
-
-  // ── Document details card ─────────────────────────────────────────────────
+  // ── Document details card (Professional SignIt style) ────────────────────
   const docRows = [
-    ['Document Title',  safe(doc.title        || doc.documentTitle || 'Untitled')],
-    ['Document ID',     String(doc._id        || doc.id || '—')],
-    ['Company',         safe(doc.companyName  || '—')],
-    ['Sent By',         safe(doc.bossName || (doc.parties && doc.parties[0]?.name) || '—')],
-    ['Total Signers',   String((doc.parties || doc.sessions || []).length)],
-    ['Status',          'COMPLETED'],
-    ['Completed At',    doc.completedAt
-      ? new Date(doc.completedAt).toUTCString()
-      : new Date().toUTCString()],
+    ['Document name',   safe(doc.title        || doc.documentTitle || 'Untitled')],
+    ['Document ID',     String(doc._id        || doc.id || '—').slice(0, 32)],
+    ['Sender',          safe(doc.bossName || (doc.parties && doc.parties[0]?.name) || doc.companyName || '—')],
+    ['Date of creation', doc.createdAt 
+      ? new Date(doc.createdAt).toLocaleString('en-US', { 
+          month: '2-digit', day: '2-digit', year: 'numeric',
+          hour: '2-digit', minute: '2-digit', hour12: false 
+        })
+      : new Date().toLocaleString('en-US', { 
+          month: '2-digit', day: '2-digit', year: 'numeric',
+          hour: '2-digit', minute: '2-digit', hour12: false 
+        })],
   ];
 
-  const cardH = docRows.length * 17 + 26;
-  rect(page, M, Y - cardH, CW, cardH, C.bgA, C.lgrey);
-  rect(page, M, Y - cardH, 4,  cardH, C.brand); // accent bar
+  const cardH = docRows.length * 16 + 20;
+  // Light blue/gray background like SignIt
+  rect(page, M, Y - cardH, CW, cardH, rgb(0.95, 0.97, 0.99), rgb(0.88, 0.92, 0.96));
 
-  txt(page, 'DOCUMENT DETAILS', M + 10, Y - 14, { font: fontB, size: 7.5, color: C.brand });
+  // No "DOCUMENT DETAILS" title - cleaner like SignIt
 
   let iy = Y - 28;
   for (const [label, val] of docRows) {
@@ -1979,11 +2030,20 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
 
   Y -= cardH + 18;
 
-  // ── Signers section ───────────────────────────────────────────────────────
-  txt(page, 'SIGNERS', M, Y, { font: fontB, size: 9, color: C.grey });
-  Y -= 5;
-  hr(page, Y, M, M + CW, C.brand, 1.5);
-  Y -= 14;
+  // ── Signers section (Clean table style like SignIt) ──────────────────────
+  Y -= 20;
+  txt(page, 'Signers', M, Y, { font: fontB, size: 11, color: C.dark });
+  Y -= 8;
+  hr(page, Y, M, M + CW, rgb(0.88, 0.92, 0.96), 1);
+  Y -= 16;
+  
+  // Table headers (like SignIt)
+  rect(page, M, Y - 18, CW, 18, rgb(0.95, 0.97, 0.99));
+  txt(page, 'Name', M + 8, Y - 12, { font: fontB, size: 8, color: C.grey });
+  txt(page, 'Role', M + 150, Y - 12, { font: fontB, size: 8, color: C.grey });
+  txt(page, 'Status', M + 240, Y - 12, { font: fontB, size: 8, color: C.grey });
+  txt(page, 'Contact Method', M + 320, Y - 12, { font: fontB, size: 8, color: C.grey });
+  Y -= 22;
 
   // Support both Module 1 (parties[]) and Module 2 (sessions[] or parties[])
   const signers = doc.parties || doc.sessions || [];
@@ -2115,9 +2175,42 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
 }
 
 function _auditFooter(page, fontR, fontM, PW, M, PH) {
-  rect(page, 0, 0, PW, 32, C.brand);
-  txt(page, 'NexSign  |  Enterprise E-Signature Platform', M, 20, { font: fontR, size: 8, color: C.white });
-  txt(page, `Confidential & Legally Binding  |  ${new Date().toUTCString()}`, M, 8, { font: fontM, size: 7, color: rgb(0.85, 0.96, 1) });
+  // Professional footer like SignIt/DocuSign
+  // Light gray background instead of colored
+  rect(page, 0, 0, PW, 40, rgb(0.97, 0.97, 0.97));
+  
+  // Top border line
+  hr(page, 40, 0, PW, rgb(0.85, 0.85, 0.85), 0.5);
+  
+  // "Powered by NexSign" with subtle branding
+  txt(page, 'Powered by', M, 24, { 
+    font: fontR, 
+    size: 7.5, 
+    color: rgb(0.5, 0.5, 0.5) 
+  });
+  txt(page, 'NexSign', M + 52, 24, { 
+    font: fontR, 
+    size: 8.5, 
+    color: C.brand 
+  });
+  
+  // Legal text (right side)
+  const legalText = 'Confidential & Legally Binding Document';
+  const legalWidth = fontR.widthOfTextAtSize(legalText, 7);
+  txt(page, legalText, PW - M - legalWidth, 24, { 
+    font: fontR, 
+    size: 7, 
+    color: rgb(0.5, 0.5, 0.5) 
+  });
+  
+  // Timestamp (center bottom)
+  const timestamp = new Date().toUTCString();
+  const tsWidth = fontM.widthOfTextAtSize(timestamp, 6.5);
+  txt(page, timestamp, (PW - tsWidth) / 2, 10, { 
+    font: fontM, 
+    size: 6.5, 
+    color: rgb(0.6, 0.6, 0.6) 
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
