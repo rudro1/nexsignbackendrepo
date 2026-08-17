@@ -1874,13 +1874,36 @@ async function appendAuditPage(pdfBytes, doc) {
   const fontB  = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
   const fontM  = await pdfDoc.embedFont(StandardFonts.Courier);
 
-  _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc);
+  // Embed company logo if available
+  let logoImage = null;
+  const logoUrl = doc.companyLogo || (doc.owner && doc.owner.companyLogo);
+  if (logoUrl && typeof logoUrl === 'string' && (logoUrl.startsWith('http://') || logoUrl.startsWith('https://'))) {
+    try {
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 8000);
+      const res = await fetch(logoUrl, { signal: ctrl.signal });
+      clearTimeout(tid);
+      if (res.ok) {
+        const buf = await res.buffer();
+        const contentType = res.headers.get('content-type') || '';
+        if (logoUrl.match(/\.png$/i) || contentType.includes('png')) {
+          logoImage = await pdfDoc.embedPng(buf).catch(() => null);
+        } else {
+          logoImage = await pdfDoc.embedJpg(buf).catch(() => null);
+        }
+      }
+    } catch (e) {
+      console.warn('[appendAuditPage] Logo embed failed:', e.message);
+    }
+  }
+
+  _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage);
 
   return Buffer.from(await pdfDoc.save({ useObjectStreams: false }));
 }
 
 // ─── Build the audit page (internal) ─────────────────────────────────────────
-function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc) {
+function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
   const PW = 612, PH = 792;   // US Letter
   const M  = 44;              // horizontal margin
   const CW = PW - M * 2;     // content width
@@ -1892,9 +1915,29 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc) {
   rect(page, 0, PH - 90, PW, 90,  C.dark);   // dark background
   rect(page, 0, PH - 90, PW, 3,   C.brand);  // top accent
 
-  // NexSign logo mark (simple square with "N")
-  rect(page, M, PH - 68, 36, 36, C.brand);
-  txt(page, 'N', M + 10, PH - 53, { font: fontB, size: 18, color: C.white });
+  // Company Logo or fallback "N"
+  if (logoImage) {
+    // Embed actual company logo
+    const logoW = 54;
+    const logoH = 40;
+    try {
+      page.drawImage(logoImage, {
+        x: M,
+        y: PH - 68,
+        width: logoW,
+        height: logoH,
+        opacity: 1,
+      });
+    } catch (e) {
+      // Fallback to "N" if image draw fails
+      rect(page, M, PH - 68, 36, 36, C.brand);
+      txt(page, 'N', M + 10, PH - 53, { font: fontB, size: 18, color: C.white });
+    }
+  } else {
+    // Fallback: Simple "N" square
+    rect(page, M, PH - 68, 36, 36, C.brand);
+    txt(page, 'N', M + 10, PH - 53, { font: fontB, size: 18, color: C.white });
+  }
 
   txt(page, 'NexSign', M + 44, PH - 50, { font: fontB, size: 15, color: C.white });
   txt(page, 'Certificate of Completion  |  Audit Trail', M + 44, PH - 65, { font: fontR, size: 9, color: rgb(0.6, 0.75, 0.85) });
