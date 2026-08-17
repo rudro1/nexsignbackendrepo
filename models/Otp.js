@@ -24,6 +24,25 @@ const otpSchema = new mongoose.Schema(
       type:    Number,
       default: 0,
     },
+    // Email delivery tracking
+    deliveryStatus: {
+      type:    String,
+      enum:    ['pending', 'sent', 'failed'],
+      default: 'pending',
+    },
+    deliveryAttempts: {
+      type:    Number,
+      default: 0,
+    },
+    sentAt: {
+      type: Date,
+    },
+    lastAttemptAt: {
+      type: Date,
+    },
+    errorMessage: {
+      type: String,
+    },
     createdAt: {
       type:    Date,
       default: Date.now,
@@ -34,5 +53,8 @@ const otpSchema = new mongoose.Schema(
     timestamps: true,
   }
 );
+
+// Compound index for rate limiting
+otpSchema.index({ email: 1, purpose: 1, createdAt: 1 });
 
 module.exports = mongoose.models.Otp || mongoose.model('Otp', otpSchema);

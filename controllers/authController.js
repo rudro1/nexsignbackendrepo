@@ -86,29 +86,94 @@ exports.sendSignupOtp = async (req, res) => {
       });
     }
 
+    // Rate limiting: max 3 OTP requests per 10 minutes
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+    const recentAttempts = await Otp.countDocuments({
+      email: cleanEmail,
+      purpose: 'signup',
+      createdAt: { $gte: tenMinutesAgo }
+    });
+
+    if (recentAttempts >= 3) {
+      console.log(`[SendSignupOtp] Rate limit exceeded for ${cleanEmail}`);
+      return res.status(429).json({
+        success: false,
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: 'Maximum OTP requests reached. Please wait 10 minutes.',
+      });
+    }
+
     // Generate secure 6-digit numeric OTP
     const otp = crypto.randomInt(100000, 1000000).toString();
 
     // Remove any previous OTP for this email
     await Otp.deleteMany({ email: cleanEmail, purpose: 'signup' });
 
-    // Store in DB with 10-min TTL
-    await Otp.create({
-      email:   cleanEmail,
+    // Create OTP with delivery tracking
+    const otpDoc = await Otp.create({
+      email: cleanEmail,
       otp,
       purpose: 'signup',
+      deliveryStatus: 'pending',
+      deliveryAttempts: 0,
     });
 
-    // Send email
-    await sendSignupOtpEmail({
-      toEmail:  cleanEmail,
-      userName: resolvedName,
-      otp,
-    });
+    // Retry logic: 3 attempts with exponential backoff
+    const delays = [0, 1500, 3000];
+    let lastError = null;
+    let emailSent = false;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) {
+          await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+        }
+
+        otpDoc.deliveryAttempts = attempt + 1;
+        otpDoc.lastAttemptAt = new Date();
+        await otpDoc.save();
+
+        const result = await sendSignupOtpEmail({
+          toEmail: cleanEmail,
+          userName: resolvedName,
+          otp,
+        });
+
+        if (result && result.success !== false) {
+          otpDoc.deliveryStatus = 'sent';
+          otpDoc.sentAt = new Date();
+          otpDoc.errorMessage = null;
+          await otpDoc.save();
+          
+          emailSent = true;
+          console.log(`[SendSignupOtp] Delivered to ${cleanEmail} on attempt ${attempt + 1}`);
+          break;
+        }
+
+        lastError = result?.error || 'Delivery failed';
+        console.warn(`[SendSignupOtp] Attempt ${attempt + 1} failed: ${lastError}`);
+
+      } catch (err) {
+        lastError = err.message;
+        console.error(`[SendSignupOtp] Attempt ${attempt + 1} error:`, err.message);
+      }
+    }
+
+    if (!emailSent) {
+      otpDoc.deliveryStatus = 'failed';
+      otpDoc.errorMessage = lastError;
+      await otpDoc.save();
+
+      return res.status(503).json({
+        success: false,
+        code: 'EMAIL_SERVICE_UNAVAILABLE',
+        message: 'Unable to send verification email. Please try again in a few minutes.',
+      });
+    }
 
     return res.json({
       success: true,
-      message: 'Verification code sent to your email.',
+      message: 'Verification code sent. Check your spam folder if you don't see it.',
     });
 
   } catch (err) {
