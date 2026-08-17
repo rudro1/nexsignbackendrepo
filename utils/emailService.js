@@ -2502,34 +2502,15 @@ function customBodyHasLink(text, actionUrl) {
 const EMAIL_CONFIG = {
 
   signing_request: {
-    subject: d => `Action Required: Please sign "${d.docTitle}" — ${d.companyName}`,
+    subject: d => `Signature Request by ${d.senderName}: ${d.docTitle}`,
     heroIcon:    'sign',
     iconBg:      '#EFF6FF',
     heroTitle:   () => 'Signature Requested',
-    bodyParagraphs: d => {
-      const paras = [
-        `Dear ${escapeHtml(d.signerName)},`,
-        `${escapeHtml(d.companyName)} has requested your electronic signature on the document referenced below. Please review its contents carefully and sign at your earliest convenience.`,
-      ];
-      if (d.partyNumber && d.totalParties > 1) {
-        paras.push(
-          `You are signer ${d.partyNumber} of ${d.totalParties} in the signing sequence. The document will proceed to the next party once you have completed your signature.`,
-        );
-      }
-      paras.push(
-        `If you have any questions regarding this document, please contact ${escapeHtml(d.senderName)} directly.`,
-      );
-      if (d.includeReviewPdf) {
-        paras.push(
-          'A copy of the document is <strong>attached to this email</strong> for your review before signing.',
-        );
-      }
-      return paras;
-    },
-    closingLine: d => {
-      const sig = senderLine(d.senderName, d.senderDesignation, d.companyName);
-      return `Thank you for your prompt attention.<br/><br/>Sincerely,<br/>${sig}`;
-    },
+    bodyParagraphs: d => [
+      `${escapeHtml(d.senderName)} is requesting your electronic signature on the document below.`,
+      `Please review and sign at your earliest convenience.`,
+    ],
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     buttonText:  d => `Sign &ldquo;${escapeHtml(d.docTitle || 'Document')}&rdquo;`,
     showButton:  true,
     hasPdf:      false,
@@ -2537,48 +2518,15 @@ const EMAIL_CONFIG = {
 
   /** Template employee signing — personalized professional body */
   employee_signing_request: {
-    subject: d => `Please sign "${d.docTitle}" — ${d.companyName || 'NexSign'}`,
+    subject: d => `Signature Request by ${d.bossName || d.senderName}: ${d.docTitle}`,
     heroIcon:    'sign',
     iconBg:      '#EFF6FF',
     heroTitle:   () => 'Your Signature Is Required',
-    bodyParagraphs: d => {
-      const name = escapeHtml(d.employeeName || d.signerName || 'Colleague');
-      const boss = escapeHtml(d.bossName || d.senderName || 'Your manager');
-      const company = escapeHtml(d.companyName || 'your organization');
-      const title = escapeHtml(d.docTitle || 'Document');
-      const paras = [
-        `Dear ${name},`,
-      ];
-      if (d.employeeDesignation) {
-        paras.push(
-          `This request is addressed to you as <strong>${escapeHtml(d.employeeDesignation)}</strong> at ${company}.`,
-        );
-      }
-      paras.push(
-        `${boss} has reviewed and signed <strong>${title}</strong>. Your electronic signature is now required to complete this document.`,
-        `Please open the secure link below, review the document in full, and sign at your earliest convenience. This link is unique to you and should not be forwarded.`,
-      );
-      if (d.expiryDate) {
-        paras.push(`This signing link expires on <strong>${escapeHtml(d.expiryDate)}</strong>.`);
-      }
-      paras.push(
-        `If you have any questions about this document, please contact ${boss}${d.bossDesignation ? ` (${escapeHtml(d.bossDesignation)})` : ''} directly.`,
-      );
-      if (d.includeReviewPdf) {
-        paras.push(
-          'A copy of the document is <strong>attached to this email</strong> for your review before signing.',
-        );
-      }
-      return paras;
-    },
-    closingLine: d => {
-      const sig = senderLine(
-        d.bossName || d.senderName,
-        d.bossDesignation || d.senderDesignation,
-        d.companyName,
-      );
-      return `Thank you for your prompt attention.<br/><br/>Sincerely,<br/>${sig}`;
-    },
+    bodyParagraphs: d => [
+      `${escapeHtml(d.bossName || d.senderName)} has signed and approved this document. Your signature is now required.`,
+      `Please review and sign using the secure link below.`,
+    ],
+    closingLine: d => `${escapeHtml(d.bossName || d.senderName)}${d.bossDesignation || d.senderDesignation ? `, ${escapeHtml(d.bossDesignation || d.senderDesignation)}` : ''}<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     buttonText:  d => `Sign &ldquo;${escapeHtml(d.docTitle || 'Document')}&rdquo;`,
     showButton:  true,
     hasPdf:      false,
@@ -2603,52 +2551,45 @@ const EMAIL_CONFIG = {
   },
 
   campaign_boss_sign: {
-    subject: d => `Your signature required: "${d.docTitle}"`,
+    subject: d => `Signature Request by ${d.ownerName || 'Template Owner'}: ${d.docTitle}`,
     heroIcon:    'sign',
     iconBg:      '#EFF6FF',
     heroTitle:   () => 'Authoriser Signature Required',
     bodyParagraphs: d => [
-      `Dear ${escapeHtml(d.signerName)},`,
-      `You have been designated as the authoriser for <strong>${escapeHtml(d.docTitle)}</strong>. Please review the document and add your signature to authorize distribution.`,
-      `After you sign, ${d.approverCount > 0 ? `${d.approverCount} approver(s) will review in sequence, then` : ''} signing links will be sent to <strong>${d.employeeCount}</strong> employee(s).`,
-      `If you have questions, contact ${escapeHtml(d.ownerName || 'the template owner')}.`,
+      `You are the authoriser for <strong>${escapeHtml(d.docTitle)}</strong>. Please review and sign to authorize distribution.`,
+      `After you sign, it will be sent to <strong>${d.employeeCount}</strong> employee(s).`,
     ],
-    closingLine: d => `Thank you,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     buttonText:  d => `Sign &amp; Authorize`,
     showButton:  true,
     hasPdf:      false,
   },
 
   campaign_approver: {
-    subject: d => `Approval required (${d.stepNumber}/${d.totalSteps}): "${d.docTitle}"`,
+    subject: d => `Approval Required (${d.stepNumber}/${d.totalSteps}): ${d.docTitle}`,
     heroIcon:    'sign',
     iconBg:      '#F0F9FF',
     heroTitle:   () => 'Your Approval Is Required',
     bodyParagraphs: d => [
-      `Dear ${escapeHtml(d.signerName)},`,
-      d.employeeDesignation
-        ? `As <strong>${escapeHtml(d.employeeDesignation)}</strong>, you are approver ${d.stepNumber} of ${d.totalSteps} for <strong>${escapeHtml(d.docTitle)}</strong>.`
-        : `You are approver ${d.stepNumber} of ${d.totalSteps} for <strong>${escapeHtml(d.docTitle)}</strong>.`,
-      `Please review the document. When you approve, ${d.isLastApprover ? 'signing links will be sent to all employees.' : 'the next approver in the chain will be notified.'}`,
-      d.previousApprovers
-        ? `Already approved by: ${d.previousApprovers}`
-        : '',
+      `You are approver ${d.stepNumber} of ${d.totalSteps} for <strong>${escapeHtml(d.docTitle)}</strong>.`,
+      d.isLastApprover 
+        ? `When you approve, signing links will be sent to all employees.`
+        : `When you approve, the next approver will be notified.`,
     ].filter(Boolean),
-    closingLine: d => `Thank you for your review,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     buttonText:  () => 'Review &amp; Approve',
     showButton:  true,
     hasPdf:      false,
   },
 
   completion: {
-    subject:     d => `Completed: "${d.docTitle}" — Signed copy attached`,
+    subject:     d => `Completed: All signatories have signed ${d.docTitle}`,
     heroIcon:    'check',
     iconBg:      '#F0FDF4',
     heroTitle:   () => 'Document Fully Executed',
     bodyParagraphs: d => [
-      `Dear ${escapeHtml(d.signerName)},`,
-      `All required parties have signed <strong>${escapeHtml(d.docTitle)}</strong>. A completed copy of the fully executed document is attached to this email for your records.`,
-      `Please retain this document in a secure location. It constitutes a legally binding agreement.`,
+      `All required parties have signed <strong>${escapeHtml(d.docTitle)}</strong>.`,
+      `The fully executed document with audit certificate is attached to this email.`,
     ],
     closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     showButton:  false,
@@ -2656,15 +2597,13 @@ const EMAIL_CONFIG = {
   },
 
   employee_signed_copy: {
-    subject:     d => `Your signed copy: "${d.docTitle}"`,
+    subject:     d => `Your signed copy: ${d.docTitle}`,
     heroIcon:    'check',
     iconBg:      '#F0FDF4',
     heroTitle:   () => 'Thank You — Signed Copy Enclosed',
     bodyParagraphs: d => [
-      `Dear ${escapeHtml(d.signerName)},`,
-      `Thank you for signing <strong>${escapeHtml(d.docTitle)}</strong>. Your signature has been securely recorded.`,
-      `A completed copy of the document with your signature and the audit certificate is attached to this email for your records.`,
-      `Please save this copy in a secure location.`,
+      `Your signature has been recorded on <strong>${escapeHtml(d.docTitle)}</strong>.`,
+      `Your signed copy with audit certificate is attached.`,
     ],
     closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     showButton:  false,
@@ -2672,84 +2611,77 @@ const EMAIL_CONFIG = {
   },
 
   cc_initial_notice: {
-    subject:     d => `[CC Notice] "${d.docTitle}" — Sent for Signature`,
+    subject:     d => `[CC] ${d.docTitle} — Sent for Signature`,
     heroIcon:    'copy',
     iconBg:      '#FAF5FF',
     heroTitle:   () => 'Document Sent for Signature',
     bodyParagraphs: d => [
-      `Dear ${escapeHtml(d.ccName || d.signerName)},`,
-      `You are receiving this notification as a courtesy copy. <strong>${escapeHtml(d.docTitle)}</strong> has been prepared and sent for electronic signature.`,
-      `This document is currently undergoing sequential signing by the designated parties. No action is required from you at this time.`,
-      `Once all parties have completed signing, you will automatically receive an email with the fully executed document and Certificate of Completion attached.`,
+      `You are receiving this as a courtesy copy. <strong>${escapeHtml(d.docTitle)}</strong> has been sent for signature.`,
+      `You will receive the fully executed document once all parties have signed.`,
     ],
-    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     showButton:  false,
     hasPdf:      false,
   },
 
   cc_notification: {
-    subject:     d => `[Completed Copy] "${d.docTitle}" — Fully Executed`,
+    subject:     d => `[Completed] ${d.docTitle} — Fully Executed`,
     heroIcon:    'copy',
     iconBg:      '#FAF5FF',
     heroTitle:   () => 'Completed Document — For Your Records',
     bodyParagraphs: d => [
-      `Dear ${escapeHtml(d.ccName || d.signerName)},`,
-      `You are receiving this email as a courtesy copy. <strong>${escapeHtml(d.docTitle)}</strong> has been fully signed and executed by all required parties.`,
-      `The finalized document with the legal Certificate of Completion (audit trail) is attached to this email for your reference and records.`,
+      `All parties have signed <strong>${escapeHtml(d.docTitle)}</strong>.`,
+      `The completed document is attached for your records.`,
     ],
-    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')} via NexSign`,
+    closingLine: d => `Best regards,<br/>${escapeHtml(d.companyName || 'NexSign')}`,
     showButton:  false,
     hasPdf:      true,
   },
 
   boss_signed_confirm: {
-    subject:     d => `Confirmation: Your signature on "${d.docTitle}" has been recorded`,
+    subject:     d => `Confirmation: Your signature on ${d.docTitle} has been recorded`,
     heroIcon:    'celebrate',
     iconBg:      '#F0FDF4',
     heroTitle:   () => 'Signature Recorded Successfully',
     bodyParagraphs: d => [
-      `Dear ${escapeHtml(d.bossName || d.signerName)},`,
-      `Your signature on <strong>${escapeHtml(d.docTitle)}</strong> has been securely recorded.`,
-      `Signing invitations are now being sent to <strong>${d.recipientCount || 0} recipient(s)</strong>. You will receive a notification once all parties have completed signing.`,
+      `Your signature has been recorded. Signing requests are being sent to <strong>${d.recipientCount || 0} recipient(s)</strong>.`,
+      `You will be notified when all signatures are complete.`,
     ],
-    closingLine: () => `Best regards,<br/>The NexSign Team`,
+    closingLine: () => `Best regards,<br/>NexSign`,
     showButton:  false,
     hasPdf:      false,
   },
 
   resend_request: {
-    subject:     d => `Reminder: Signature pending on "${d.docTitle}"`,
+    subject:     d => `Reminder: ${d.docTitle} awaits your signature`,
     heroIcon:    'clock',
     iconBg:      '#FFFBEB',
     heroTitle:   () => 'Friendly Reminder — Action Required',
     bodyParagraphs: d => [
-      `Dear ${escapeHtml(d.signerName)},`,
-      `This is a courteous reminder that <strong>${escapeHtml(d.docTitle)}</strong> from ${escapeHtml(d.companyName)} is awaiting your electronic signature.`,
-      `Please review and sign the document at your earliest convenience using the secure link below.`,
+      `Reminder: <strong>${escapeHtml(d.docTitle)}</strong> from ${escapeHtml(d.companyName)} is awaiting your signature.`,
+      `Please sign using the secure link below.`,
     ],
-    closingLine: d => senderLine(d.senderName, d.senderDesignation, d.companyName),
+    closingLine: d => `${escapeHtml(d.senderName)}${d.senderDesignation ? `, ${escapeHtml(d.senderDesignation)}` : ''}<br/>${escapeHtml(d.companyName)}`,
     buttonText:  'Complete Signature',
     showButton:  true,
     hasPdf:      false,
   },
 
   declined_notification: {
-    subject:     d => `Notice: "${d.docTitle}" was declined`,
+    subject:     d => `Notice: ${d.docTitle} was declined`,
     heroIcon:    'clock',
     iconBg:      '#FEF2F2',
     heroTitle:   () => 'Document Declined',
     bodyParagraphs: d => {
       const paras = [
-        `Dear ${escapeHtml(d.signerName || 'there')},`,
         `<strong>${escapeHtml(d.declinerName || 'A signer')}</strong> has declined to sign <strong>${escapeHtml(d.docTitle)}</strong>.`,
       ];
       if (d.reason) {
-        paras.push(`<strong>Reason provided:</strong> ${escapeHtml(d.reason)}`);
+        paras.push(`Reason: ${escapeHtml(d.reason)}`);
       }
-      paras.push(`No further action is required from other parties at this time. You may contact the signer directly if you wish to follow up.`);
       return paras;
     },
-    closingLine: () => `Best regards,<br/>The NexSign Team`,
+    closingLine: () => `Best regards,<br/>NexSign`,
     showButton:  false,
     hasPdf:      false,
   },
@@ -2985,7 +2917,7 @@ function buildEmailHtml(opts) {
               </p>
               <p style="margin:6px 0 0;font-size:13px;color:#15803d;line-height:1.6;
                         font-family:Georgia,'Times New Roman',Times,serif;">
-                &ldquo;${escapeHtml(documentTitle)}&rdquo; is attached to this email. Please save it for your records.
+                The signed document is attached to this email for your records.
               </p>
             </td>
           </tr>
@@ -3141,12 +3073,12 @@ function buildEmailHtml(opts) {
                 <td style="padding:16px 20px;">
                   <p style="margin:0;font-size:12px;color:#475569;font-weight:700;
                             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-                    Security Notice
+                    Security &amp; Legal Notice
                   </p>
                   <p style="margin:6px 0 0;font-size:12px;color:#64748b;line-height:1.7;
                             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-                    This request was sent through NexSign&rsquo;s secure electronic signature platform.
-                    Your signature is legally binding and recorded with a complete audit trail.
+                    This email contains a secure link to sign. Please do not share or forward this email as the signing link is unique to you. 
+                    NexSign is a secure electronic signature platform that complies with applicable electronic signature laws. 
                     If you did not expect this email, you may safely disregard it.
                   </p>
                 </td>
