@@ -3573,6 +3573,67 @@ async function sendFeedbackEmail(userEmail, userName, stars, message = '') {
   });
 }
 
+/**
+ * Send 6-digit secure OTP verification email for account signup.
+ */
+async function sendSignupOtpEmail({ toEmail, userName, otp }) {
+  const transporter = getTransporter();
+  const cleanEmail  = String(toEmail || '').trim().toLowerCase();
+  const cleanName   = String(userName || 'there').trim().slice(0, 80);
+  const fromEmail   = process.env.SMTP_USER || process.env.EMAIL_USER;
+
+  if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    throw new Error('Valid recipient email is required.');
+  }
+
+  const otpCodeHtml = `
+    <div style="text-align:center;margin:28px 0;">
+      <div style="display:inline-block;background:#f0f9ff;border:2px dashed #0284c7;border-radius:12px;padding:16px 32px;">
+        <span style="font-family:'Courier New',Courier,monospace;font-size:36px;font-weight:900;letter-spacing:10px;color:#0284c7;display:block;">
+          ${escapeHtml(otp)}
+        </span>
+      </div>
+      <p style="margin:12px 0 0;font-size:13px;color:#64748b;font-weight:600;">
+        Valid for 10 minutes &bull; Do not share this code with anyone
+      </p>
+    </div>
+  `;
+
+  const html = buildEmailHtml({
+    subject:          `Your NeXsign Verification Code: ${otp}`,
+    heroTitle:        'Verify Your Email Address',
+    bodyHtml:         formatBodyParagraphs([
+      `Hello <strong>${escapeHtml(cleanName)}</strong>,`,
+      `Thank you for choosing <strong>NeXsign</strong> — the secure electronic signature platform.`,
+      `Please use the following 6-digit verification code to complete your registration and activate your account:`,
+      otpCodeHtml,
+      `If you did not request this verification code, you can safely disregard this email. Your email address remains secure.`,
+    ]),
+    customMessageBlock: '',
+    closingHtml:      `<p style="margin:0;font-size:13px;color:#475569;">Best regards,<br/><strong>The NeXsign Security Team</strong></p>`,
+    buttonText:       '',
+    showButton:       false,
+    hasPdf:           false,
+    actionUrl:        '',
+    documentTitle:    'Account Security Verification',
+    documentSubtitle: 'One-Time Password (OTP)',
+    senderName:       'NeXsign Security',
+    senderDesignation: 'Verification Service',
+    companyName:      'NeXsign',
+    companyLogo:      'https://nexsign-front.vercel.app/nexsign-logo.png',
+    companyInitial:   'N',
+    expiryDate:       '10 minutes',
+    emailHeaderColor: '#0284c7',
+  });
+
+  await transporter.sendMail({
+    from:    `"NeXsign Security" <${fromEmail}>`,
+    to:      cleanEmail,
+    subject: `Your NeXsign Verification Code: ${otp}`,
+    html,
+  });
+}
+
 module.exports = {
   sendEmail,
   sendSigningEmail,
@@ -3586,6 +3647,7 @@ module.exports = {
   sendEmployeeSignedCopyEmail,
   sendCCEmail,
   sendFeedbackEmail,
+  sendSignupOtpEmail,
   EMAIL_CONFIG,
   getDocumentSubtitle,
   buildEmailHtml,

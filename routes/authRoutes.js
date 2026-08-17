@@ -8,6 +8,9 @@ const router    = express.Router();
 const {
   login,
   register,
+  sendSignupOtp,
+  verifySignupOtp,
+  resendSignupOtp,
   googleAuth,
   syncPassword,
   getMe,
@@ -52,9 +55,12 @@ const updateLimiter = rateLimit({
 // ═══════════════════════════════════════════════════════════════
 // PUBLIC ROUTES
 // ═══════════════════════════════════════════════════════════════
-router.post('/register',      authLimiter, register);
-router.post('/login',         authLimiter, login);
-router.post('/google',        authLimiter, googleAuth);
+router.post('/send-signup-otp',   authLimiter, sendSignupOtp);
+router.post('/verify-signup-otp', authLimiter, verifySignupOtp);
+router.post('/resend-signup-otp', authLimiter, resendSignupOtp);
+router.post('/register',          authLimiter, register);
+router.post('/login',             authLimiter, login);
+router.post('/google',            authLimiter, googleAuth);
 
 // ✅ sync-password route add
 router.post('/sync-password', authLimiter, syncPassword);

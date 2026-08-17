@@ -1,7 +1,10 @@
 'use strict';
 
-const User = require('../models/User');
-const jwt  = require('jsonwebtoken');
+const crypto = require('crypto');
+const User   = require('../models/User');
+const Otp    = require('../models/Otp');
+const jwt    = require('jsonwebtoken');
+const { sendSignupOtpEmail } = require('../utils/emailService');
 
 // ════════════════════════════════════════════════════════════════
 // HELPERS
@@ -50,7 +53,234 @@ function getRequestMeta(req) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// POST /auth/register
+// POST /auth/send-signup-otp
+// ════════════════════════════════════════════════════════════════
+exports.sendSignupOtp = async (req, res) => {
+  try {
+    const { name, full_name, email, password } = req.body;
+    const resolvedName = (full_name || name || '').trim();
+
+    if (!resolvedName || !email?.trim() || !password) {
+      return res.status(400).json({
+        success: false,
+        code:    'VALIDATION_ERROR',
+        message: 'Name, email and password are required.',
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        code:    'WEAK_PASSWORD',
+        message: 'Password must be at least 6 characters.',
+      });
+    }
+
+    const cleanEmail = email.toLowerCase().trim();
+    const existing   = await User.findOne({ email: cleanEmail }).select('_id').lean();
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        code:    'EMAIL_EXISTS',
+        message: 'This email is already registered. Please log in.',
+      });
+    }
+
+    // Generate secure 6-digit numeric OTP
+    const otp = crypto.randomInt(100000, 1000000).toString();
+
+    // Remove any previous OTP for this email
+    await Otp.deleteMany({ email: cleanEmail, purpose: 'signup' });
+
+    // Store in DB with 10-min TTL
+    await Otp.create({
+      email:   cleanEmail,
+      otp,
+      purpose: 'signup',
+    });
+
+    // Send email
+    await sendSignupOtpEmail({
+      toEmail:  cleanEmail,
+      userName: resolvedName,
+      otp,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Verification code sent to your email.',
+    });
+
+  } catch (err) {
+    console.error('[SendSignupOtp Error]', err.message);
+    return res.status(500).json({
+      success: false,
+      code:    'SERVER_ERROR',
+      message: 'Failed to send verification code. Please try again.',
+    });
+  }
+};
+
+// ════════════════════════════════════════════════════════════════
+// POST /auth/verify-signup-otp
+// ════════════════════════════════════════════════════════════════
+exports.verifySignupOtp = async (req, res) => {
+  try {
+    const { name, full_name, email, password, otp,
+            company_name, designation, phone } = req.body;
+
+    const resolvedName = (full_name || name || '').trim();
+    const cleanEmail   = (email || '').toLowerCase().trim();
+    const cleanOtp     = (otp || '').trim();
+
+    if (!resolvedName || !cleanEmail || !password || !cleanOtp) {
+      return res.status(400).json({
+        success: false,
+        code:    'VALIDATION_ERROR',
+        message: 'All fields including verification code are required.',
+      });
+    }
+
+    const existing = await User.findOne({ email: cleanEmail }).select('_id').lean();
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        code:    'EMAIL_EXISTS',
+        message: 'This email is already registered. Please log in.',
+      });
+    }
+
+    // Lookup OTP
+    const otpDoc = await Otp.findOne({ email: cleanEmail, purpose: 'signup' });
+    if (!otpDoc) {
+      return res.status(400).json({
+        success: false,
+        code:    'OTP_EXPIRED',
+        message: 'Verification code expired or invalid. Please request a new code.',
+      });
+    }
+
+    if (otpDoc.attempts >= 5) {
+      await Otp.deleteOne({ _id: otpDoc._id });
+      return res.status(400).json({
+        success: false,
+        code:    'TOO_MANY_ATTEMPTS',
+        message: 'Too many incorrect attempts. Please request a new verification code.',
+      });
+    }
+
+    if (otpDoc.otp !== cleanOtp) {
+      otpDoc.attempts += 1;
+      await otpDoc.save();
+      return res.status(400).json({
+        success: false,
+        code:    'INVALID_OTP',
+        message: 'Incorrect verification code. Please check your email and try again.',
+      });
+    }
+
+    // OTP Valid! Create verified user account
+    await Otp.deleteOne({ _id: otpDoc._id });
+
+    const user = await User.create({
+      full_name:         resolvedName,
+      email:             cleanEmail,
+      password,
+      role:              'user',
+      company_name:      company_name?.trim() || null,
+      designation:       designation?.trim()  || null,
+      phone:             phone?.trim()        || null,
+      is_email_verified: true,
+    });
+
+    const { ip, userAgent } = getRequestMeta(req);
+    user.last_login        = new Date();
+    user.last_login_ip     = ip;
+    user.last_login_device = userAgent.substring(0, 200);
+    await user.save();
+
+    return res.status(201).json({
+      success: true,
+      message: 'Account verified and created successfully.',
+      token:   generateToken(user),
+      user:    userResponse(user),
+    });
+
+  } catch (err) {
+    console.error('[VerifySignupOtp Error]', err.message);
+    if (err.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        code:    'EMAIL_EXISTS',
+        message: 'This email is already registered.',
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      code:    'SERVER_ERROR',
+      message: 'Verification failed. Please try again.',
+    });
+  }
+};
+
+// ════════════════════════════════════════════════════════════════
+// POST /auth/resend-signup-otp
+// ════════════════════════════════════════════════════════════════
+exports.resendSignupOtp = async (req, res) => {
+  try {
+    const { name, full_name, email } = req.body;
+    const resolvedName = (full_name || name || 'there').trim();
+    const cleanEmail   = (email || '').toLowerCase().trim();
+
+    if (!cleanEmail) {
+      return res.status(400).json({
+        success: false,
+        code:    'VALIDATION_ERROR',
+        message: 'Email is required.',
+      });
+    }
+
+    const existing = await User.findOne({ email: cleanEmail }).select('_id').lean();
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        code:    'EMAIL_EXISTS',
+        message: 'This email is already registered.',
+      });
+    }
+
+    const otp = crypto.randomInt(100000, 1000000).toString();
+
+    await Otp.deleteMany({ email: cleanEmail, purpose: 'signup' });
+    await Otp.create({
+      email:   cleanEmail,
+      otp,
+      purpose: 'signup',
+    });
+
+    await sendSignupOtpEmail({
+      toEmail:  cleanEmail,
+      userName: resolvedName,
+      otp,
+    });
+
+    return res.json({
+      success: true,
+      message: 'New verification code sent to your email.',
+    });
+
+  } catch (err) {
+    console.error('[ResendSignupOtp Error]', err.message);
+    return res.status(500).json({
+      success: false,
+      code:    'SERVER_ERROR',
+      message: 'Failed to resend code. Please try again.',
+    });
+  }
+};
+
+// ════════════════════════════════════════════════════════════════
+// POST /auth/register (direct fallback)
 // ════════════════════════════════════════════════════════════════
 exports.register = async (req, res) => {
   try {
