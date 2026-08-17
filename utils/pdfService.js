@@ -1516,6 +1516,25 @@ function rect(page, x, y, w, h, fill, borderColor = null, borderWidth = 0.6) {
   });
 }
 
+/**
+ * Draw NexSign pencil logo (text-only version for PDF)
+ * Multi-font wordmark: "NexSign"
+ * Colors: #1a1a2e (black) or white for dark backgrounds
+ */
+function drawNexSignLogo(page, x, y, fontB, isDark = false) {
+  const logoColor = isDark 
+    ? rgb(1, 1, 1)                          // white for dark backgrounds
+    : rgb(0.102, 0.102, 0.180);             // #1a1a2e (nexBlack)
+  const accentColor = rgb(0.310, 0.639, 0.820); // #4FA3D1 (--sky)
+  
+  // Draw "Nex" in black/white
+  txt(page, 'Nex', x, y, { font: fontB, size: 18, color: logoColor });
+  const nexWidth = fontB.widthOfTextAtSize('Nex', 18);
+  
+  // Draw "Sign" in sky blue accent
+  txt(page, 'Sign', x + nexWidth, y, { font: fontB, size: 18, color: accentColor });
+}
+
 // ─── Coordinate conversion ────────────────────────────────────────────────────
 /**
  * Convert a field stored in % coords to absolute PDF points.
@@ -1929,10 +1948,8 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
   // ══════════════════════════════════════════════════════════════════════════
   Y = PH - 60;
   
-  // Left: "Nex" (black) + "Sign" (purple)
-  txt(page, 'Nex', M, Y, { font: fontB, size: 18, color: signItColors.nexBlack });
-  const nexWidth = fontB.widthOfTextAtSize('Nex', 18);
-  txt(page, 'Sign', M + nexWidth, Y, { font: fontB, size: 18, color: signItColors.nexPurple });
+  // Left: NexSign logo (multi-color text logo)
+  drawNexSignLogo(page, M, Y, fontB);
   
   // Right: "Audit Trail" title
   const titleText = 'Audit Trail';
@@ -1978,24 +1995,42 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
     infoY -= 16;
   }
 
-  // Seal badge on the RIGHT (simplified circle for PDF)
+  // Seal badge on the RIGHT (eye-catching star-burst style like SignIt)
   const sealSize = 110;
   const sealX = PW - M - sealSize / 2 - 10;
   const sealY = infoBoxY + infoBoxH / 2;
+  const sealR = 55;
   
-  // Green circle
+  // Draw eye-catching star-burst seal (12-point star for visual impact)
+  const points = 24; // 12 outer + 12 inner points
+  for (let i = 0; i < points; i++) {
+    const angle = (i * Math.PI) / (points / 2);
+    const radius = i % 2 === 0 ? sealR : sealR * 0.8;
+    const px = sealX + Math.cos(angle) * radius;
+    const py = sealY + Math.sin(angle) * radius;
+    
+    // Draw circles at each star point to create burst effect
+    page.drawCircle({
+      x: px,
+      y: py,
+      size: 18,
+      color: signItColors.sealGreen,
+    });
+  }
+  
+  // Fill center with large circle
   page.drawCircle({
     x: sealX,
     y: sealY,
-    size: sealSize / 2,
+    size: sealR * 0.85,
     color: signItColors.sealGreen,
   });
   
-  // Checkmark symbol (centered)
-  txt(page, '✓', sealX - 8, sealY + 8, { font: fontB, size: 22, color: C.white });
+  // Checkmark (larger, more prominent)
+  txt(page, '✓', sealX - 10, sealY + 6, { font: fontB, size: 26, color: C.white });
   
-  // "Completed" text
-  txt(page, 'Completed', sealX - 30, sealY - 10, { font: fontB, size: 8, color: C.white });
+  // "Completed" text (bold, more visible)
+  txt(page, 'Completed', sealX - 32, sealY - 14, { font: fontB, size: 9, color: C.white });
 
   Y = infoBoxY - 30;
 
@@ -2038,12 +2073,24 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
   const headerY = Y - headerRowH;
   rect(page, M + 1, headerY, CW - 2, headerRowH, signItColors.docInfoBg);
   
-  // Column headers
-  txt(page, 'Name', M + 20, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
-  txt(page, 'Role', M + 160, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
-  txt(page, 'Status', M + 260, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
-  txt(page, 'Contact Method', M + 340, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
-  txt(page, 'Verification Method', M + 450, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  // Column headers with responsive percentage-based spacing
+  const col1X = M + 12;
+  const col2X = M + Math.floor(CW * 0.30);
+  const col3X = M + Math.floor(CW * 0.48);
+  const col4X = M + Math.floor(CW * 0.62);
+  const col5X = M + Math.floor(CW * 0.80);
+  
+  const nameColX = col1X;
+  const roleColX = col2X;
+  const statusColX = col3X;
+  const contactColX = col4X;
+  const verifyColX = col5X;
+  
+  txt(page, 'Name', nameColX, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Role', roleColX, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Status', statusColX, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Contact Method', contactColX, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Verification Method', verifyColX, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
   
   Y = headerY;
 
@@ -2058,26 +2105,38 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
       hr(page, rowY, M + 1, PW - M - 1, signItColors.rowGray, 1);
     }
     
-    // Name
+    // Name with responsive maxWidth for wrapping
     const name = safe(s.name || s.recipientName || 'Unknown');
-    txt(page, name, M + 20, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 135 });
+    txt(page, name, nameColX, rowY + 8, { 
+      font: fontR, size: 9, color: signItColors.textDark, 
+      maxWidth: Math.floor(CW * 0.28)
+    });
     
-    // Role
+    // Role with responsive maxWidth for wrapping
     const role = safe(s.designation || s.role || 'Signer');
-    txt(page, role, M + 160, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 95 });
+    txt(page, role, roleColX, rowY + 8, { 
+      font: fontR, size: 9, color: signItColors.textDark, 
+      maxWidth: Math.floor(CW * 0.16)
+    });
     
     // Status
     const status = signed ? 'Completed' : 'Pending';
     const statusColor = signed ? signItColors.sealGreen : signItColors.nexPurple;
-    txt(page, status, M + 260, rowY + 8, { font: fontR, size: 9, color: statusColor });
+    txt(page, status, statusColX, rowY + 8, { font: fontR, size: 9, color: statusColor });
     
-    // Contact Method
+    // Contact Method with responsive maxWidth for wrapping
     const contact = safe(s.email || s.recipientEmail || '—');
-    txt(page, contact, M + 340, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 105 });
+    txt(page, contact, contactColX, rowY + 8, { 
+      font: fontR, size: 9, color: signItColors.textDark, 
+      maxWidth: Math.floor(CW * 0.16)
+    });
     
-    // Verification Method
+    // Verification Method with responsive maxWidth
     const verification = signed ? 'Email + OTP' : '—';
-    txt(page, verification, M + 450, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 95 });
+    txt(page, verification, verifyColX, rowY + 8, { 
+      font: fontR, size: 9, color: signItColors.textDark, 
+      maxWidth: Math.floor(CW * 0.18)
+    });
   }
   
   Y = sectionBoxY - 30;
@@ -2177,10 +2236,10 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
   const journalHeaderY = Y - journalHeaderH;
   rect(page, M + 1, journalHeaderY, CW - 2, journalHeaderH, signItColors.docInfoBg);
   
-  // Column headers (Date 18%, Action 16%, Details rest)
-  const dateColX = M + 20;
-  const actionColX = M + 110;
-  const detailsColX = M + 200;
+  // Column headers with responsive percentage-based widths (Date 22%, Action 18%, Details rest)
+  const dateColX = M + 12;
+  const actionColX = M + Math.floor(CW * 0.22);
+  const detailsColX = M + Math.floor(CW * 0.40);
   
   txt(page, 'Date', dateColX, journalHeaderY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
   txt(page, 'Action', actionColX, journalHeaderY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
@@ -2198,14 +2257,23 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
       hr(page, rowY, M + 1, PW - M - 1, signItColors.rowGray, 1);
     }
     
-    // Date (18% width ~ 90px)
-    txt(page, entry.date, dateColX, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 85 });
+    // Date with responsive maxWidth
+    txt(page, entry.date, dateColX, rowY + 8, { 
+      font: fontR, size: 9, color: signItColors.textDark, 
+      maxWidth: Math.floor(CW * 0.20) 
+    });
     
-    // Action (16% width ~ 85px)
-    txt(page, entry.action, actionColX, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 85 });
+    // Action with responsive maxWidth
+    txt(page, entry.action, actionColX, rowY + 8, { 
+      font: fontR, size: 9, color: signItColors.textDark, 
+      maxWidth: Math.floor(CW * 0.16) 
+    });
     
-    // Details (rest of space)
-    txt(page, entry.details, detailsColX, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: CW - 215 });
+    // Details with responsive maxWidth (rest of space)
+    txt(page, entry.details, detailsColX, rowY + 8, { 
+      font: fontR, size: 9, color: signItColors.textDark, 
+      maxWidth: Math.floor(CW * 0.58) 
+    });
   }
   
   Y = journalBoxY - 30;
