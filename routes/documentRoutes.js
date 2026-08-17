@@ -1339,14 +1339,20 @@ router.post('/sign/submit', async (req, res) => {
         .select('full_name name email designation company_logo')
         .lean();
 
-      sendSigningEmail(
-        {
+      try {
+        const payload = {
           ...buildSequentialSigningPayload(doc, nextParty, nextIdx, ownerUser || {}),
           pdfBuffer: await loadDocumentReviewPdf(doc),
-        },
-      ).catch(emailErr => {
-        console.error('[sign/submit] Next signer email failed:', emailErr.message);
-      });
+        };
+        const emailRes = await sendSigningEmail(payload);
+        if (emailRes && !emailRes.success) {
+          console.error('[sign/submit] Next signer email failed:', emailRes.error);
+        } else {
+          console.log(`[sign/submit] Next signer email successfully delivered to ${nextParty.email}`);
+        }
+      } catch (emailErr) {
+        console.error('[sign/submit] Next signer email exception:', emailErr.message);
+      }
 
       emitSocket(req, 'document:party_signed', {
         documentId: String(doc._id),
