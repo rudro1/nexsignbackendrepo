@@ -1905,105 +1905,57 @@ async function appendAuditPage(pdfBytes, doc) {
 // ─── Build the audit page (internal) ─────────────────────────────────────────
 function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
   const PW = 612, PH = 792;   // US Letter
-  const M  = 44;              // horizontal margin
+  const M  = 48;              // horizontal margin (matches SignIt)
   const CW = PW - M * 2;     // content width
+
+  // SignIt color palette (exact matches from HTML design)
+  const signItColors = {
+    nexBlack:   rgb(0.102, 0.102, 0.180),   // #1a1a2e
+    nexPurple:  rgb(0.424, 0.361, 0.906),   // #6c5ce7
+    docInfoBg:  rgb(0.933, 0.949, 0.969),   // #eef2f7
+    sealGreen:  rgb(0.184, 0.682, 0.427),   // #2fae6d
+    borderGray: rgb(0.886, 0.902, 0.918),   // #e2e6ea
+    labelGray:  rgb(0.4, 0.4, 0.4),         // #666
+    textDark:   rgb(0.133, 0.133, 0.133),   // #222
+    textLight:  rgb(0.267, 0.267, 0.267),   // #444
+    rowGray:    rgb(0.933, 0.933, 0.933),   // #eee
+  };
 
   let page = pdfDoc.addPage([PW, PH]);
   let Y    = PH;              // current Y from top (we draw downward)
 
-  // ── Professional Header (DocuSign/SignIt Style) ──────────────────────────
-  // Use user's brand color or default
-  const headerColor = doc.emailHeaderColor 
-    ? hexToRgb(doc.emailHeaderColor, C.dark) 
-    : C.dark;
+  // ══════════════════════════════════════════════════════════════════════════
+  // HEADER SECTION (SignIt style)
+  // ══════════════════════════════════════════════════════════════════════════
+  Y = PH - 60;
   
-  // Clean white background for header
-  rect(page, 0, PH - 100, PW, 100, rgb(1, 1, 1));
+  // Left: "Nex" (black) + "Sign" (purple)
+  txt(page, 'Nex', M, Y, { font: fontB, size: 18, color: signItColors.nexBlack });
+  const nexWidth = fontB.widthOfTextAtSize('Nex', 18);
+  txt(page, 'Sign', M + nexWidth, Y, { font: fontB, size: 18, color: signItColors.nexPurple });
   
-  // Company Logo (left side - user's brand)
-  if (logoImage) {
-    try {
-      const logoW = 120;
-      const logoH = 36;
-      page.drawImage(logoImage, {
-        x: M,
-        y: PH - 70,
-        width: logoW,
-        height: logoH,
-        opacity: 1,
-      });
-    } catch (e) {
-      // Fallback: Company name text
-      const companyName = safe(doc.companyName || 'Company');
-      txt(page, companyName, M, PH - 55, { 
-        font: fontB, 
-        size: 18, 
-        color: headerColor 
-      });
-    }
-  } else {
-    // Show company name if no logo
-    const companyName = safe(doc.companyName || 'Company');
-    txt(page, companyName, M, PH - 55, { 
-      font: fontB, 
-      size: 18, 
-      color: headerColor 
-    });
-  }
-  
-  // "Audit Trail" title (right side)
-  txt(page, 'Audit Trail', PW - M - 100, PH - 45, { 
-    font: fontB, 
-    size: 20, 
-    color: C.dark 
-  });
-  
-  // Completed badge (top right - professional green badge like SignIt)
-  const badgeW = 90;
-  const badgeH = 26;
-  const badgeX = PW - M - badgeW;
-  const badgeY = PH - 75;
-  
-  // Green badge with border
-  rect(page, badgeX, badgeY, badgeW, badgeH, rgb(0.9, 0.98, 0.94));
-  page.drawRectangle({
-    x: badgeX,
-    y: badgeY,
-    width: badgeW,
-    height: badgeH,
-    borderColor: C.green,
-    borderWidth: 1.5,
-  });
-  
-  // Checkmark icon + "Completed" text
-  page.drawCircle({
-    x: badgeX + 15,
-    y: badgeY + 13,
-    size: 8,
-    color: C.green,
-  });
-  txt(page, '✓', badgeX + 11, badgeY + 10, { 
-    font: fontB, 
-    size: 10, 
-    color: C.white 
-  });
-  txt(page, 'Completed', badgeX + 28, badgeY + 10, { 
-    font: fontB, 
-    size: 9, 
-    color: C.green 
-  });
-  
-  // Thin border line below header
-  hr(page, PH - 102, 0, PW, rgb(0.9, 0.9, 0.9), 1);
-  
-  Y = PH - 120;
+  // Right: "Audit Trail" title
+  const titleText = 'Audit Trail';
+  const titleWidth = fontB.widthOfTextAtSize(titleText, 17);
+  txt(page, titleText, PW - M - titleWidth, Y, { font: fontB, size: 17, color: signItColors.nexBlack });
 
-  // ── Document details card (Professional SignIt style) ────────────────────
-  const docRows = [
-    ['Document name',   safe(doc.title        || doc.documentTitle || 'Untitled')],
-    ['Document ID',     String(doc._id        || doc.id || '—').slice(0, 32)],
-    ['Sender',          safe(doc.bossName || (doc.parties && doc.parties[0]?.name) || doc.companyName || '—')],
-    ['Date of creation', doc.createdAt 
+  Y -= 40;
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // DOCUMENT INFO BOX (SignIt style)
+  // ══════════════════════════════════════════════════════════════════════════
+  const infoBoxH = 90;
+  const infoBoxY = Y - infoBoxH;
+  
+  // Draw rounded rectangle background (approximation with regular rect)
+  rect(page, M, infoBoxY, CW, infoBoxH, signItColors.docInfoBg);
+
+  // Info rows on the LEFT
+  const docInfoRows = [
+    ['Document name:',   safe(doc.title || doc.documentTitle || 'Untitled')],
+    ['Document ID:',     String(doc._id || doc.id || '—').slice(0, 24)],
+    ['Sender:',          safe(doc.bossName || (doc.parties && doc.parties[0]?.name) || doc.companyName || '—')],
+    ['Date of creation:', doc.createdAt 
       ? new Date(doc.createdAt).toLocaleString('en-US', { 
           month: '2-digit', day: '2-digit', year: 'numeric',
           hour: '2-digit', minute: '2-digit', hour12: false 
@@ -2014,160 +1966,303 @@ function _buildAuditPage(pdfDoc, fontR, fontB, fontM, doc, logoImage) {
         })],
   ];
 
-  const cardH = docRows.length * 16 + 20;
-  // Light blue/gray background like SignIt
-  rect(page, M, Y - cardH, CW, cardH, rgb(0.95, 0.97, 0.99), rgb(0.88, 0.92, 0.96));
-
-  // No "DOCUMENT DETAILS" title - cleaner like SignIt
-
-  let iy = Y - 28;
-  for (const [label, val] of docRows) {
-    const lw = fontB.widthOfTextAtSize(`${label}: `, 8.5);
-    txt(page, `${label}:`, M + 10, iy, { font: fontB, size: 8.5, color: C.grey });
-    txt(page, val, M + 10 + lw, iy, { font: fontR, size: 8.5, color: C.dark, maxWidth: CW - lw - 20 });
-    iy -= 17;
+  let infoY = Y - 20;
+  for (const [label, value] of docInfoRows) {
+    txt(page, label, M + 28, infoY, { font: fontR, size: 9.5, color: rgb(0.2, 0.2, 0.2) });
+    txt(page, value, M + 28 + fontR.widthOfTextAtSize(label, 9.5) + 3, infoY, { 
+      font: fontB, 
+      size: 9.5, 
+      color: signItColors.nexBlack,
+      maxWidth: CW - 180
+    });
+    infoY -= 16;
   }
 
-  Y -= cardH + 18;
-
-  // ── Signers section (Clean table style like SignIt) ──────────────────────
-  Y -= 20;
-  txt(page, 'Signers', M, Y, { font: fontB, size: 11, color: C.dark });
-  Y -= 8;
-  hr(page, Y, M, M + CW, rgb(0.88, 0.92, 0.96), 1);
-  Y -= 16;
+  // Seal badge on the RIGHT (simplified circle for PDF)
+  const sealSize = 110;
+  const sealX = PW - M - sealSize / 2 - 10;
+  const sealY = infoBoxY + infoBoxH / 2;
   
-  // Table headers (like SignIt)
-  rect(page, M, Y - 18, CW, 18, rgb(0.95, 0.97, 0.99));
-  txt(page, 'Name', M + 8, Y - 12, { font: fontB, size: 8, color: C.grey });
-  txt(page, 'Role', M + 150, Y - 12, { font: fontB, size: 8, color: C.grey });
-  txt(page, 'Status', M + 240, Y - 12, { font: fontB, size: 8, color: C.grey });
-  txt(page, 'Contact Method', M + 320, Y - 12, { font: fontB, size: 8, color: C.grey });
-  Y -= 22;
+  // Green circle
+  page.drawCircle({
+    x: sealX,
+    y: sealY,
+    size: sealSize / 2,
+    color: signItColors.sealGreen,
+  });
+  
+  // Checkmark symbol (centered)
+  txt(page, '✓', sealX - 8, sealY + 8, { font: fontB, size: 22, color: C.white });
+  
+  // "Completed" text
+  txt(page, 'Completed', sealX - 30, sealY - 10, { font: fontB, size: 8, color: C.white });
 
-  // Support both Module 1 (parties[]) and Module 2 (sessions[] or parties[])
+  Y = infoBoxY - 30;
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SIGNERS SECTION (bordered section with floating label - SignIt style)
+  // ══════════════════════════════════════════════════════════════════════════
+  const sectionY = Y;
+  
+  // Calculate section height based on signers
   const signers = doc.parties || doc.sessions || [];
+  const headerRowH = 24;
+  const dataRowH = 22;
+  const sectionPadding = 18;
+  const signersTableH = headerRowH + (signers.length * dataRowH) + sectionPadding * 2;
+  
+  const sectionBoxY = Y - signersTableH;
+  
+  // Draw section border
+  page.drawRectangle({
+    x: M,
+    y: sectionBoxY,
+    width: CW,
+    height: signersTableH,
+    borderColor: signItColors.borderGray,
+    borderWidth: 1,
+  });
+  
+  // Floating label "Signers" (positioned at top of border with white background)
+  const labelText = 'Signers';
+  const labelWidth = fontR.widthOfTextAtSize(labelText, 8.5);
+  const labelX = M + 15;
+  const labelY = Y + 11;
+  
+  // White background for label
+  rect(page, labelX - 4, labelY - 4, labelWidth + 8, 15, C.white);
+  txt(page, labelText, labelX, labelY, { font: fontR, size: 8.5, color: signItColors.labelGray });
+  
+  // Table header row
+  Y -= 18;
+  const headerY = Y - headerRowH;
+  rect(page, M + 1, headerY, CW - 2, headerRowH, signItColors.docInfoBg);
+  
+  // Column headers
+  txt(page, 'Name', M + 20, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Role', M + 160, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Status', M + 260, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Contact Method', M + 340, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Verification Method', M + 450, headerY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  
+  Y = headerY;
 
+  // Table data rows
   for (let i = 0; i < signers.length; i++) {
-    const s      = signers[i];
+    const s = signers[i];
     const signed = s.status === 'signed' || !!s.signedAt;
-
-    // Build detail lines for this signer
-    const details = [];
-    if (s.designation)
-      details.push(['Designation', safe(s.designation)]);
-    if (s.role)
-      details.push(['Signing Role', safe(s.role)]);
-    if (s.localSignedAt || s.localSignedTime || s.signedAt)
-      details.push(['Signed At', safe(s.localSignedAt || s.localSignedTime || new Date(s.signedAt).toUTCString())]);
-    if (s.ipAddress || s.ip)
-      details.push(['IP Address', safe(s.ipAddress || s.ip)]);
-    if (s.device || s.browser)
-      details.push(['Device / OS', safe([s.device, s.browser, s.os].filter(Boolean).join(' / '))]);
-    if (s.city || s.country)
-      details.push(['Location', safe([s.city, s.region, s.country].filter(Boolean).join(', ') + (s.postalCode ? ` (${s.postalCode})` : ''))]);
-    if (s.latitude && s.longitude)
-      details.push(['Coordinates (GPS)', `${s.latitude}, ${s.longitude}`]);
-    if (s.timezone)
-      details.push(['Timezone', safe(s.timezone)]);
-    if (s.geoSource || s.geo_source)
-      details.push(['Location Source', safe((s.geoSource || s.geo_source || '').toUpperCase())]);
-
-    const rowH = 46 + details.length * 13;
-
-    // New page check
-    if (Y - rowH < M + 80) {
-      _auditFooter(page, fontR, fontM, PW, M, PH);
-      page = pdfDoc.addPage([PW, PH]);
-      Y    = PH - M;
-      txt(page, 'SIGNERS (continued)', M, Y, { font: fontB, size: 10, color: C.brand });
-      Y -= 18;
+    const rowY = Y - dataRowH * (i + 1);
+    
+    // Row border (except last row)
+    if (i < signers.length - 1) {
+      hr(page, rowY, M + 1, PW - M - 1, signItColors.rowGray, 1);
     }
-
-    const rowFill = i % 2 === 0 ? C.bgA : rgb(0.988, 1, 1);
-    rect(page, M, Y - rowH, CW, rowH, rowFill, C.lgrey);
-    rect(page, M, Y - rowH, 4,  rowH, signed ? C.green : C.amber);
-
-    // Numbered circle
-    page.drawCircle({ x: M + 18, y: Y - 18, size: 11, color: signed ? C.green : C.amber });
-    txt(page, String(i + 1), M + (i < 9 ? 15 : 11), Y - 22, { font: fontB, size: 8.5, color: C.white });
-
-    // Name + Designation, email
-    const nameWithDesig = safe([s.name || s.recipientName || 'Unknown', s.designation ? `(${s.designation})` : ''].filter(Boolean).join(' '));
-    txt(page, nameWithDesig, M + 36, Y - 12, { font: fontB, size: 9.5, color: C.dark, maxWidth: CW - 120 });
-    txt(page, safe(s.email || s.recipientEmail || ''), M + 36, Y - 26, { font: fontM, size: 8, color: C.grey, maxWidth: CW / 2 });
-
-    // Status badge
-    const badgeFill  = signed ? C.green  : C.amber;
-    const badgeLabel = signed ? 'SIGNED' : 'PENDING';
-    rect(page, PW - M - 70, Y - 24, 68, 16, badgeFill);
-    txt(page, badgeLabel, PW - M - 59, Y - 17, { font: fontB, size: 7.5, color: C.white });
-
-    // Detail lines
-    if (details.length) {
-      hr(page, Y - 38, M + 8, M + CW - 8, C.lgrey, 0.4);
-      let dy = Y - 50;
-      for (const [dlabel, dval] of details) {
-        const lw = fontB.widthOfTextAtSize(`${dlabel}: `, 7.5);
-        txt(page, `${dlabel}:`, M + 14, dy, { font: fontB, size: 7.5, color: C.grey });
-        txt(page, dval, M + 14 + lw, dy, { font: fontM, size: 7.5, color: C.dark, maxWidth: CW - lw - 22 });
-        dy -= 13;
-      }
-    }
-
-    Y -= rowH + 8;
+    
+    // Name
+    const name = safe(s.name || s.recipientName || 'Unknown');
+    txt(page, name, M + 20, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 135 });
+    
+    // Role
+    const role = safe(s.designation || s.role || 'Signer');
+    txt(page, role, M + 160, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 95 });
+    
+    // Status
+    const status = signed ? 'Completed' : 'Pending';
+    const statusColor = signed ? signItColors.sealGreen : signItColors.nexPurple;
+    txt(page, status, M + 260, rowY + 8, { font: fontR, size: 9, color: statusColor });
+    
+    // Contact Method
+    const contact = safe(s.email || s.recipientEmail || '—');
+    txt(page, contact, M + 340, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 105 });
+    
+    // Verification Method
+    const verification = signed ? 'Email + OTP' : '—';
+    txt(page, verification, M + 450, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 95 });
   }
+  
+  Y = sectionBoxY - 30;
 
-  // ── CC Recipients ─────────────────────────────────────────────────────────
-  const ccList = doc.ccList || doc.cc || [];
-  if (ccList.length && Y > M + 60) {
-    Y -= 10;
-    txt(page, 'CC RECIPIENTS', M, Y, { font: fontB, size: 9, color: C.grey });
-    Y -= 5;
-    hr(page, Y, M, M + CW, C.lgrey, 0.8);
-    Y -= 10;
-
-    for (const cc of ccList) {
-      if (Y < M + 40) break;
-      rect(page, M, Y - 22, CW, 23, rgb(0.957, 0.976, 1), C.lgrey);
-      rect(page, M, Y - 22, 3,  23, C.blue);
-      const nameStr = safe([cc.name, cc.designation].filter(Boolean).join(' · '));
-      txt(page, nameStr, M + 10, Y - 8, { font: fontB, size: 9, color: C.dark, maxWidth: CW / 2 });
-      txt(page, safe(cc.email || ''), M + CW / 2, Y - 8, { font: fontM, size: 8, color: C.grey, maxWidth: CW / 2 - 10 });
-      Y -= 27;
+  // ══════════════════════════════════════════════════════════════════════════
+  // JOURNAL SECTION (bordered section with floating label - SignIt style)
+  // ══════════════════════════════════════════════════════════════════════════
+  
+  // Build journal entries
+  const journalEntries = [];
+  
+  // Document created
+  if (doc.createdAt) {
+    journalEntries.push({
+      date: new Date(doc.createdAt).toLocaleString('en-US', { 
+        month: '2-digit', day: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false 
+      }),
+      action: 'Created',
+      details: `Document created by ${safe(doc.bossName || doc.companyName || 'Sender')}`,
+    });
+  }
+  
+  // Signers sent
+  if (doc.createdAt) {
+    journalEntries.push({
+      date: new Date(doc.createdAt).toLocaleString('en-US', { 
+        month: '2-digit', day: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false 
+      }),
+      action: 'Sent',
+      details: `Sent to ${signers.length} recipient(s) for signature`,
+    });
+  }
+  
+  // Signature events
+  for (const s of signers) {
+    if (s.signedAt) {
+      journalEntries.push({
+        date: new Date(s.signedAt).toLocaleString('en-US', { 
+          month: '2-digit', day: '2-digit', year: 'numeric',
+          hour: '2-digit', minute: '2-digit', hour12: false 
+        }),
+        action: 'Signed',
+        details: `Signed by ${safe(s.name || s.recipientName || 'Unknown')} from IP ${safe(s.ipAddress || s.ip || 'N/A')}`,
+      });
     }
   }
+  
+  // Completed
+  if (doc.completedAt) {
+    journalEntries.push({
+      date: new Date(doc.completedAt).toLocaleString('en-US', { 
+        month: '2-digit', day: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false 
+      }),
+      action: 'Completed',
+      details: 'All signatures collected, document finalized',
+    });
+  }
+  
+  const journalHeaderH = 24;
+  const journalRowH = 22;
+  const journalPadding = 18;
+  const journalTableH = journalHeaderH + (journalEntries.length * journalRowH) + journalPadding * 2;
+  
+  // Check if we need a new page
+  if (Y - journalTableH < M + 100) {
+    _auditFooter(page, fontR, fontM, PW, M, PH);
+    page = pdfDoc.addPage([PW, PH]);
+    Y = PH - M;
+  }
+  
+  const journalBoxY = Y - journalTableH;
+  
+  // Draw section border
+  page.drawRectangle({
+    x: M,
+    y: journalBoxY,
+    width: CW,
+    height: journalTableH,
+    borderColor: signItColors.borderGray,
+    borderWidth: 1,
+  });
+  
+  // Floating label "Journal"
+  const journalLabelText = 'Journal';
+  const journalLabelWidth = fontR.widthOfTextAtSize(journalLabelText, 8.5);
+  const journalLabelX = M + 15;
+  const journalLabelY = Y + 11;
+  
+  rect(page, journalLabelX - 4, journalLabelY - 4, journalLabelWidth + 8, 15, C.white);
+  txt(page, journalLabelText, journalLabelX, journalLabelY, { font: fontR, size: 8.5, color: signItColors.labelGray });
+  
+  // Table header row
+  Y -= 18;
+  const journalHeaderY = Y - journalHeaderH;
+  rect(page, M + 1, journalHeaderY, CW - 2, journalHeaderH, signItColors.docInfoBg);
+  
+  // Column headers (Date 18%, Action 16%, Details rest)
+  const dateColX = M + 20;
+  const actionColX = M + 110;
+  const detailsColX = M + 200;
+  
+  txt(page, 'Date', dateColX, journalHeaderY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Action', actionColX, journalHeaderY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  txt(page, 'Details', detailsColX, journalHeaderY + 10, { font: fontB, size: 8.5, color: signItColors.nexBlack });
+  
+  Y = journalHeaderY;
 
-  // ── Legal disclaimer ──────────────────────────────────────────────────────
-  if (Y > M + 60) {
-    Y -= 10;
-    const signersForHash = signers.map(s => ({
-      email:     s.email || s.recipientEmail,
-      signedAt:  s.signedAt,
-      ip:        s.ipAddress || s.ip,
-    }));
-    const auditRecordId = crypto
-      .createHash('sha256')
-      .update(JSON.stringify({
-        docId: String(doc._id || doc.id || ''),
-        title: doc.title || doc.documentTitle,
-        completedAt: doc.completedAt || new Date().toISOString(),
-        signers: signersForHash,
-      }))
-      .digest('hex')
-      .slice(0, 16)
-      .toUpperCase();
+  // Journal data rows
+  for (let i = 0; i < journalEntries.length; i++) {
+    const entry = journalEntries[i];
+    const rowY = Y - journalRowH * (i + 1);
+    
+    // Row border (except last row)
+    if (i < journalEntries.length - 1) {
+      hr(page, rowY, M + 1, PW - M - 1, signItColors.rowGray, 1);
+    }
+    
+    // Date (18% width ~ 90px)
+    txt(page, entry.date, dateColX, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 85 });
+    
+    // Action (16% width ~ 85px)
+    txt(page, entry.action, actionColX, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: 85 });
+    
+    // Details (rest of space)
+    txt(page, entry.details, detailsColX, rowY + 8, { font: fontR, size: 9, color: signItColors.textDark, maxWidth: CW - 215 });
+  }
+  
+  Y = journalBoxY - 30;
 
-    const dH = 62;
-    rect(page, M, Y - dH, CW, dH, C.blueL, C.lgrey);
-    rect(page, M, Y - dH, 4,  dH, C.blue);
-    txt(page, 'LEGAL NOTICE — CERTIFICATE OF COMPLETION', M + 10, Y - 14, { font: fontB, size: 8, color: C.blue });
-    txt(page, 'This certificate is an electronically generated legal record of all signature events associated with this document.',
-      M + 10, Y - 26, { font: fontR, size: 7.5, color: C.grey, maxWidth: CW - 20 });
-    txt(page, 'Legally binding under the U.S. ESIGN Act (15 U.S.C. §7001), eIDAS (EU), and applicable electronic signature laws. Location data may include GPS (device) or IP-based estimates.',
-      M + 10, Y - 38, { font: fontR, size: 7.5, color: C.grey, maxWidth: CW - 20 });
-    txt(page, `Audit Record ID: ${auditRecordId}  |  UTC: ${new Date().toISOString()}`,
-      M + 10, Y - 52, { font: fontM, size: 7, color: C.dark, maxWidth: CW - 20 });
+  // ══════════════════════════════════════════════════════════════════════════
+  // LEGAL NOTICE SECTION (bordered section - SignIt style)
+  // ══════════════════════════════════════════════════════════════════════════
+  const legalNoticeH = 90;
+  
+  // Check if we need a new page
+  if (Y - legalNoticeH < M + 50) {
+    _auditFooter(page, fontR, fontM, PW, M, PH);
+    page = pdfDoc.addPage([PW, PH]);
+    Y = PH - M;
+  }
+  
+  const legalBoxY = Y - legalNoticeH;
+  
+  // Draw section border
+  page.drawRectangle({
+    x: M,
+    y: legalBoxY,
+    width: CW,
+    height: legalNoticeH,
+    borderColor: signItColors.borderGray,
+    borderWidth: 1,
+  });
+  
+  // Floating label "Legal Notice"
+  const legalLabelText = 'Legal Notice';
+  const legalLabelWidth = fontR.widthOfTextAtSize(legalLabelText, 8.5);
+  const legalLabelX = M + 15;
+  const legalLabelY = Y + 11;
+  
+  rect(page, legalLabelX - 4, legalLabelY - 4, legalLabelWidth + 8, 15, C.white);
+  txt(page, legalLabelText, legalLabelX, legalLabelY, { font: fontR, size: 8.5, color: signItColors.labelGray });
+  
+  // Legal text content
+  const legalLines = [
+    'This document has been electronically signed using NexSign\'s digital signature platform and',
+    'constitutes a legally binding agreement under applicable electronic signature laws, including but not',
+    'limited to the U.S. Electronic Signatures in Global and National Commerce Act (ESIGN), the Uniform',
+    'Electronic Transactions Act (UETA), and the European Union\'s eIDAS regulation.',
+    '',
+    'The audit trail contained in this certificate provides a comprehensive record of all signature events,',
+    'including timestamps, IP addresses, and verification methods used. This certificate serves as legal',
+    'proof of the signing process and the authenticity of all signatures affixed to this document.',
+  ];
+  
+  let legalY = Y - 20;
+  for (const line of legalLines) {
+    if (line === '') {
+      legalY -= 8;
+    } else {
+      txt(page, line, M + 20, legalY, { font: fontR, size: 8.5, color: signItColors.textLight, maxWidth: CW - 40 });
+      legalY -= 12;
+    }
   }
 
   // Footer on last page
