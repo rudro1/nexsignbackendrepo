@@ -173,7 +173,7 @@ exports.sendSignupOtp = async (req, res) => {
 
     return res.json({
       success: true,
-      message: 'Verification code sent. Check your spam folder if you don't see it.',
+      message: 'Verification code sent. Check your spam folder if you don\'t see it.',
     });
 
   } catch (err) {
